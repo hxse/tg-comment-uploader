@@ -1,0 +1,16 @@
+/config/*.json
+!/config/example.json
+/.local/
+/.venv/
+/.pytest_cache/
+/.ruff_cache/
+/.ty/
+__pycache__/
+*.pyc
+/result
+/dist/
+/build/
+*.egg-info/
+/.coverage
+/htmlcov/
+/.direnv/

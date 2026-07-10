@@ -1,0 +1,26 @@
+{
+  "bot": {
+    "token": "123456789:REPLACE_WITH_BOT_TOKEN",
+    "api_id": 123456,
+    "api_hash": "REPLACE_WITH_API_HASH"
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 48973,
+    "binary": "telegram-bot-api",
+    "work_dir": ".local/telegram-bot-api"
+  },
+  "profiles": {
+    "default": {
+      "chat_id": "-1001234567890",
+      "reply_message_id": 12345,
+      "caption": "{stem}",
+      "supports_streaming": true
+    },
+    "direct": {
+      "chat_id": "-1009876543210",
+      "caption": "{stem}",
+      "supports_streaming": true
+    }
+  }
+}

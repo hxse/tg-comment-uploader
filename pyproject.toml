@@ -1,0 +1,22 @@
+[project]
+name = "tg-comment-uploader"
+version = "0.1.0"
+description = "Upload local videos to Telegram channel comments through a local Bot API server."
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+tg-comment-uploader = "tg_comment_uploader.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
