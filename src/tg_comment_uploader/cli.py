@@ -5,25 +5,43 @@ import errno
 import http.client
 import json
 import mimetypes
+import signal
 import shutil
 import socket
 import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from string import Formatter
-from typing import Any
+from typing import Any, TypeVar, cast
+
+from .locking import UploadLockError, upload_instance_lock
+from .media_compress import CompressionProgress
+from .media_split import SplitProgress
+from .media_workflow import MediaPreparationError, OversizePolicy, prepare_media
+from .terminal_progress import ResponseWaitIndicator, TerminalProgress
 
 CHUNK_SIZE = 1024 * 1024
 PROGRESS_INTERVAL_SECONDS = 0.5
 UPLOAD_TIMEOUT_SECONDS = 6 * 60 * 60
 DEFAULT_PROFILE = "default"
 DEFAULT_RETRIES = 5
-MAX_LOCAL_BOT_API_UPLOAD_MIB = 2000
-MAX_LOCAL_BOT_API_UPLOAD_BYTES = MAX_LOCAL_BOT_API_UPLOAD_MIB * 1024 * 1024
+SAFE_UPLOAD_LIMIT_BYTES = 2_000_000_000
+SPLIT_MEDIA_TARGET_BYTES = SAFE_UPLOAD_LIMIT_BYTES * 98 // 100
+COMPRESS_MEDIA_TARGET_BYTES = SAFE_UPLOAD_LIMIT_BYTES * 95 // 100
+OVERSIZE_POLICIES = ("error", "split", "compress")
+OVERSIZE_POLICY_HINT = (
+    "Use --oversize-policy split for lossless splitting, or "
+    "--oversize-policy compress for lossy compression."
+)
+MEDIA_GROUP_MAX_ITEMS = 10
 MAX_RETRY_AFTER_SECONDS = 24 * 60 * 60
+
+UploadResultT = TypeVar("UploadResultT")
 TRANSIENT_NETWORK_ERRNOS = {
     errno.ECONNABORTED,
     errno.ECONNRESET,
@@ -98,6 +116,28 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
+@contextmanager
+def termination_as_interrupt() -> Iterator[None]:
+    """Translate SIGTERM into normal Python unwinding during an upload."""
+
+    previous_handler = signal.getsignal(signal.SIGTERM)
+
+    def handle_sigterm(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, handle_sigterm)
+    except ValueError:
+        # Signal handlers can only be installed by the main thread.
+        yield
+        return
+
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tg-comment-uploader")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -118,6 +158,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=non_negative_int,
         default=DEFAULT_RETRIES,
         help="retry count after the first failed attempt for each file",
+    )
+    upload.add_argument(
+        "-o",
+        "--oversize-policy",
+        choices=OVERSIZE_POLICIES,
+        default="error",
+        help="how to handle files above the safe upload limit (default: error)",
     )
     upload.add_argument("paths", nargs="+")
     upload.set_defaults(func=run_upload)
@@ -157,20 +204,151 @@ def run_server(args: argparse.Namespace) -> int:
 
 
 def run_upload(args: argparse.Namespace) -> int:
+    try:
+        with termination_as_interrupt(), upload_instance_lock():
+            return run_upload_locked(args)
+    except UploadLockError as exc:
+        raise AppError(str(exc)) from exc
+
+
+def prepared_media_target_bytes(policy: OversizePolicy) -> int:
+    if policy == "compress":
+        return COMPRESS_MEDIA_TARGET_BYTES
+    if policy in {"error", "split"}:
+        return SPLIT_MEDIA_TARGET_BYTES
+    raise ValueError(f"unsupported oversize policy: {policy}")
+
+
+def run_upload_locked(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     profile = get_profile(config, args.profile)
-    files = validate_upload_paths(args.paths)
+    oversize_policy = cast(OversizePolicy, args.oversize_policy)
+    files = validate_upload_paths(
+        args.paths,
+        allow_oversized=oversize_policy != "error",
+    )
 
-    print_upload_plan(args.profile, profile, files)
+    print_upload_plan(
+        args.profile,
+        profile,
+        files,
+        oversize_policy=oversize_policy,
+    )
 
     for index, path in enumerate(files, start=1):
+        prefix = f"[{index}/{len(files)}]"
+        renderer = TerminalProgress()
         caption = render_caption(profile.caption, path)
-        print(f"[{index}/{len(files)}] uploading: {path}")
-        result = upload_with_retries(config, profile, path, caption, retries=args.retries)
-        message_id = result.get("message_id", "unknown")
-        print(f"[{index}/{len(files)}] uploaded message_id={message_id}")
+        try:
+            renderer.log(f"{prefix} uploading: {path}")
+            try:
+                with prepare_media(
+                    path,
+                    oversize_policy,
+                    hard_limit_bytes=SAFE_UPLOAD_LIMIT_BYTES,
+                    target_bytes=prepared_media_target_bytes(oversize_policy),
+                    progress=lambda message: renderer.log(f"{prefix} {message}"),
+                    split_progress=lambda event: route_split_progress(renderer, prefix, event),
+                    compression_progress=lambda event: route_compression_progress(
+                        renderer, prefix, event
+                    ),
+                    warning=lambda message: print_preparation_warning(renderer, message),
+                ) as prepared:
+                    if prepared.is_media_group:
+                        results = upload_media_groups_with_retries(
+                            config,
+                            profile,
+                            prepared.paths,
+                            caption,
+                            source=path,
+                            retries=args.retries,
+                        )
+                        message_ids = [
+                            str(result.get("message_id", "unknown")) for result in results
+                        ]
+                        renderer.log(f"{prefix} uploaded message_ids={','.join(message_ids)}")
+                    else:
+                        result = upload_with_retries(
+                            config,
+                            profile,
+                            prepared.paths[0],
+                            caption,
+                            retries=args.retries,
+                        )
+                        message_id = result.get("message_id", "unknown")
+                        renderer.log(f"{prefix} uploaded message_id={message_id}")
+            except MediaPreparationError as exc:
+                raise NonRetryableUploadError(str(exc)) from exc
+        finally:
+            renderer.finish()
 
     return 0
+
+
+def route_split_progress(
+    renderer: TerminalProgress,
+    prefix: str,
+    event: SplitProgress,
+) -> None:
+    """Route one structured lossless-split event to terminal output."""
+
+    attempt = _progress_count(event.attempt)
+    max_attempts = _progress_count(event.max_attempts)
+    part_count = _progress_count(event.part_count)
+    if event.stage == "probing":
+        renderer.log(f"{prefix} probing media for lossless split")
+    elif event.stage == "planning":
+        renderer.log(
+            f"{prefix} planning lossless split attempt {attempt}/{max_attempts} "
+            f"({part_count} parts)"
+        )
+    elif event.stage == "splitting":
+        renderer.update(
+            f"{prefix} split attempt {attempt}/{max_attempts} ({part_count} parts)",
+            event.fraction if event.fraction is not None else 0.0,
+        )
+    elif event.stage == "validating":
+        renderer.log(
+            f"{prefix} validating {part_count} split parts from attempt {attempt}/{max_attempts}"
+        )
+    else:
+        raise ValueError(f"unsupported split progress stage: {event.stage}")
+
+
+def route_compression_progress(
+    renderer: TerminalProgress,
+    prefix: str,
+    event: CompressionProgress,
+) -> None:
+    """Route one structured two-pass compression event to terminal output."""
+
+    attempt = _progress_count(event.attempt)
+    max_attempts = _progress_count(event.max_attempts)
+    if event.stage == "probing":
+        renderer.log(f"{prefix} probing media for compression")
+    elif event.stage == "planning":
+        renderer.log(f"{prefix} planning two-pass compression")
+    elif event.stage == "compressing":
+        renderer.update(
+            f"{prefix} compress attempt {attempt}/{max_attempts} "
+            f"pass {_progress_count(event.pass_number)}/2",
+            event.fraction if event.fraction is not None else 0.0,
+        )
+    elif event.stage == "validating":
+        renderer.log(f"{prefix} validating compressed output from attempt {attempt}/{max_attempts}")
+    else:
+        raise ValueError(f"unsupported compression progress stage: {event.stage}")
+
+
+def print_preparation_warning(renderer: TerminalProgress, message: str) -> None:
+    """Keep a preparation warning separate from an active progress line."""
+
+    renderer.finish()
+    print(f"warning: {message}", file=sys.stderr)
+
+
+def _progress_count(value: int | None) -> str:
+    return str(value) if value is not None else "?"
 
 
 def load_config(path: Path) -> AppConfig:
@@ -252,7 +430,11 @@ def get_profile(config: AppConfig, profile_name: str) -> ProfileConfig:
         ) from exc
 
 
-def validate_upload_paths(paths: list[str]) -> list[Path]:
+def validate_upload_paths(
+    paths: list[str],
+    *,
+    allow_oversized: bool = False,
+) -> list[Path]:
     validated: list[Path] = []
 
     for raw_path in paths:
@@ -264,7 +446,10 @@ def validate_upload_paths(paths: list[str]) -> list[Path]:
         if not path.is_file():
             raise AppError(f"upload path is not a regular file: {path}")
         file_size = get_upload_file_size(path)
-        validate_upload_file_size(path, file_size)
+        if file_size == 0:
+            raise NonRetryableUploadError(f"upload file is empty: {path}; no upload was attempted")
+        if not allow_oversized:
+            validate_upload_file_size(path, file_size)
         validated.append(path)
 
     return validated
@@ -282,21 +467,28 @@ def get_upload_file_size(path: Path) -> int:
 def validate_upload_file_size(path: Path, file_size: int) -> None:
     if file_size == 0:
         raise NonRetryableUploadError(f"upload file is empty: {path}; no upload was attempted")
-    if file_size <= MAX_LOCAL_BOT_API_UPLOAD_BYTES:
+    if file_size <= SAFE_UPLOAD_LIMIT_BYTES:
         return
 
     raise NonRetryableUploadError(
         f"upload file is too large for Telegram local Bot API: {path}; "
         f"size={format_bytes(file_size)} ({file_size:,} bytes), "
-        f"limit={MAX_LOCAL_BOT_API_UPLOAD_MIB} MiB "
-        f"({MAX_LOCAL_BOT_API_UPLOAD_BYTES:,} bytes). "
-        "Split or re-encode the file before uploading; no upload was attempted."
+        f"limit={format_bytes(SAFE_UPLOAD_LIMIT_BYTES)} "
+        f"({SAFE_UPLOAD_LIMIT_BYTES:,} bytes). "
+        f"{OVERSIZE_POLICY_HINT} No upload was attempted."
     )
 
 
-def print_upload_plan(profile_name: str, profile: ProfileConfig, files: list[Path]) -> None:
+def print_upload_plan(
+    profile_name: str,
+    profile: ProfileConfig,
+    files: list[Path],
+    *,
+    oversize_policy: str = "error",
+) -> None:
     print(f"profile: {profile_name}")
     print(f"chat_id: {profile.chat_id}")
+    print(f"oversize_policy: {oversize_policy}")
     if profile.reply_message_id is None:
         print("delivery: direct")
         print("reply_message_id: <none>")
@@ -377,6 +569,132 @@ def send_video(
     return result
 
 
+def build_media_group_payload(
+    profile: ProfileConfig,
+    paths: Sequence[Path],
+    caption: str,
+) -> dict[str, Any]:
+    if len(paths) < 2 or len(paths) > MEDIA_GROUP_MAX_ITEMS:
+        raise ValueError(f"a Telegram media group must contain 2-{MEDIA_GROUP_MAX_ITEMS} videos")
+
+    media: list[dict[str, Any]] = []
+    for index, path in enumerate(paths):
+        file_size = get_upload_file_size(path)
+        validate_upload_file_size(path, file_size)
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as exc:
+            raise NonRetryableUploadError(
+                f"failed to resolve media-group file {path}: {exc}; not retrying"
+            ) from exc
+        if not resolved.is_file():
+            raise NonRetryableUploadError(
+                f"media-group path is not a regular file: {resolved}; not retrying"
+            )
+
+        item: dict[str, Any] = {
+            "type": "video",
+            "media": resolved.as_uri(),
+            "supports_streaming": profile.supports_streaming,
+        }
+        if index == 0 and caption:
+            item["caption"] = caption
+        media.append(item)
+
+    payload: dict[str, Any] = {
+        "chat_id": profile.chat_id,
+        "media": media,
+    }
+    if profile.reply_message_id is not None:
+        payload["reply_parameters"] = {"message_id": profile.reply_message_id}
+    return payload
+
+
+def send_media_group(
+    config: AppConfig,
+    profile: ProfileConfig,
+    paths: Sequence[Path],
+    caption: str,
+) -> list[dict[str, Any]]:
+    payload = build_media_group_payload(profile, paths, caption)
+    response = post_json(
+        host=config.server.host,
+        port=config.server.port,
+        token=config.bot.token,
+        method="sendMediaGroup",
+        payload=payload,
+        file_path=paths[0],
+    )
+
+    if response.get("ok") is not True:
+        raise make_bot_api_error(response, http_status=None, file_path=paths[0])
+
+    result = response.get("result")
+    if (
+        not isinstance(result, list)
+        or len(result) != len(paths)
+        or not all(isinstance(item, dict) for item in result)
+    ):
+        raise NonRetryableUploadError(
+            f"upload outcome is uncertain for media group starting with {paths[0]}: "
+            "Bot API reported success without the expected message list; "
+            "not retrying to avoid duplicates"
+        )
+    return cast(list[dict[str, Any]], result)
+
+
+def partition_media_groups(paths: Sequence[Path]) -> tuple[tuple[Path, ...], ...]:
+    if len(paths) < 2:
+        raise ValueError("at least two paths are required for media-group partitioning")
+
+    group_count = (len(paths) + MEDIA_GROUP_MAX_ITEMS - 1) // MEDIA_GROUP_MAX_ITEMS
+    base_size, larger_group_count = divmod(len(paths), group_count)
+    if base_size < 2 or base_size + (1 if larger_group_count else 0) > MEDIA_GROUP_MAX_ITEMS:
+        raise ValueError("cannot partition paths into valid Telegram media groups")
+
+    groups: list[tuple[Path, ...]] = []
+    offset = 0
+    for group_index in range(group_count):
+        group_size = base_size + (1 if group_index < larger_group_count else 0)
+        groups.append(tuple(paths[offset : offset + group_size]))
+        offset += group_size
+    return tuple(groups)
+
+
+def upload_media_groups_with_retries(
+    config: AppConfig,
+    profile: ProfileConfig,
+    paths: Sequence[Path],
+    caption: str,
+    *,
+    source: Path,
+    retries: int,
+) -> list[dict[str, Any]]:
+    groups = partition_media_groups(paths)
+    results: list[dict[str, Any]] = []
+    for group_index, group in enumerate(groups, start=1):
+        label = f"{source} media group {group_index}/{len(groups)}"
+        print(f"uploading media group {group_index}/{len(groups)} ({len(group)} videos): {source}")
+        try:
+            group_result = retry_upload(
+                lambda group=group: send_media_group(config, profile, group, caption),
+                label=label,
+                retries=retries,
+            )
+        except AppError as exc:
+            if group_index > 1:
+                uploaded_count = len(results)
+                raise AppError(
+                    f"upload partially succeeded for {source}: {uploaded_count} split "
+                    f"video message(s) in {group_index - 1} media group(s) were already "
+                    f"sent before media group {group_index}/{len(groups)} failed; "
+                    f"rerunning the whole command may duplicate them; current error: {exc}"
+                ) from exc
+            raise
+        results.extend(group_result)
+    return results
+
+
 def upload_with_retries(
     config: AppConfig,
     profile: ProfileConfig,
@@ -385,14 +703,30 @@ def upload_with_retries(
     *,
     retries: int,
 ) -> dict[str, Any]:
+    return retry_upload(
+        lambda: send_video(config, profile, path, caption),
+        label=str(path),
+        retries=retries,
+    )
+
+
+def retry_upload(
+    action: Callable[[], UploadResultT],
+    *,
+    label: str,
+    retries: int,
+) -> UploadResultT:
+    if retries < 0:
+        raise ValueError("retries must be non-negative")
+
     attempts = retries + 1
     last_error: RetryableUploadError | None = None
 
     for attempt in range(1, attempts + 1):
         try:
             if attempts > 1:
-                print(f"attempt {attempt}/{attempts}: {path}")
-            return send_video(config, profile, path, caption)
+                print(f"attempt {attempt}/{attempts}: {label}")
+            return action()
         except RetryableUploadError as exc:
             last_error = exc
             if attempt >= attempts:
@@ -407,7 +741,7 @@ def upload_with_retries(
 
     assert last_error is not None
     raise AppError(
-        f"upload failed after {attempts} attempts for {path}: {last_error}"
+        f"upload failed after {attempts} attempts for {label}: {last_error}"
     ) from last_error
 
 
@@ -451,8 +785,9 @@ def post_multipart(
         connection.send(closing)
         request_body_sent = True
 
-        response = connection.getresponse()
-        body = response.read()
+        with ResponseWaitIndicator():
+            response = connection.getresponse()
+            body = response.read()
     except (OSError, http.client.HTTPException) as exc:
         http_status = response.status if response is not None else None
         retry_after_header = response.getheader("Retry-After") if response is not None else None
@@ -502,6 +837,88 @@ def post_multipart(
         )
 
     return payload
+
+
+def post_json(
+    *,
+    host: str,
+    port: int,
+    token: str,
+    method: str,
+    payload: dict[str, Any],
+    file_path: Path,
+) -> dict[str, Any]:
+    body_to_send = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    connection = http.client.HTTPConnection(host, port, timeout=UPLOAD_TIMEOUT_SECONDS)
+    request_body_sent = False
+    response: http.client.HTTPResponse | None = None
+    body: bytes | None = None
+    try:
+        connection.putrequest("POST", f"/bot{token}/{method}")
+        connection.putheader("Host", f"{host}:{port}")
+        connection.putheader("Content-Type", "application/json; charset=utf-8")
+        connection.putheader("Content-Length", str(len(body_to_send)))
+        connection.endheaders()
+        connection.send(body_to_send)
+        request_body_sent = True
+
+        with ResponseWaitIndicator():
+            response = connection.getresponse()
+            body = response.read()
+    except (OSError, http.client.HTTPException) as exc:
+        http_status = response.status if response is not None else None
+        retry_after_header = response.getheader("Retry-After") if response is not None else None
+        raise make_transport_error(
+            host,
+            port,
+            exc,
+            request_body_sent=request_body_sent,
+            http_status=http_status,
+            retry_after_header=retry_after_header,
+        ) from exc
+    finally:
+        connection.close()
+
+    assert response is not None
+    assert body is not None
+
+    try:
+        decoded = json.loads(body.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise response_protocol_error(
+            response.status,
+            f"Bot API returned a non-UTF-8 response with HTTP {response.status}",
+            retry_after_header=response.getheader("Retry-After"),
+        ) from exc
+    except json.JSONDecodeError as exc:
+        snippet = body[:500].decode("utf-8", errors="replace")
+        raise response_protocol_error(
+            response.status,
+            f"Bot API returned invalid JSON with HTTP {response.status}: {snippet}",
+            retry_after_header=response.getheader("Retry-After"),
+        ) from exc
+
+    if not isinstance(decoded, dict):
+        raise response_protocol_error(
+            response.status,
+            f"Bot API returned a non-object JSON response with HTTP {response.status}",
+            retry_after_header=response.getheader("Retry-After"),
+        )
+
+    if response.status < 200 or response.status >= 300:
+        raise make_bot_api_error(
+            decoded,
+            http_status=response.status,
+            file_path=file_path,
+            retry_after_header=response.getheader("Retry-After"),
+        )
+
+    return decoded
 
 
 def response_protocol_error(
@@ -642,12 +1059,13 @@ def make_bot_api_error(
         except OSError:
             file_size = None
 
-        if file_size is not None and file_size > MAX_LOCAL_BOT_API_UPLOAD_BYTES:
+        if file_size is not None and file_size > SAFE_UPLOAD_LIMIT_BYTES:
             return NonRetryableUploadError(
                 f"{message}; file {file_path} is {format_bytes(file_size)} "
                 f"({file_size:,} bytes), exceeding the Telegram Bot limit of "
-                f"{MAX_LOCAL_BOT_API_UPLOAD_MIB} MiB "
-                f"({MAX_LOCAL_BOT_API_UPLOAD_BYTES:,} bytes); not retrying"
+                f"{format_bytes(SAFE_UPLOAD_LIMIT_BYTES)} "
+                f"({SAFE_UPLOAD_LIMIT_BYTES:,} bytes); "
+                f"{OVERSIZE_POLICY_HINT} Not retrying"
             )
 
         size_detail = (
@@ -679,70 +1097,97 @@ def send_file_with_progress(
     sent = 0
     started_at = time.monotonic()
     last_report_at = 0.0
+    progress_is_tty = _stdout_is_tty()
+    progress_width = print_progress(sent, file_size, started_at, force=True)
 
-    print_progress(sent, file_size, started_at, force=True)
     try:
-        file = file_path.open("rb")
-    except OSError as exc:
-        raise NonRetryableUploadError(
-            f"failed to open upload file {file_path}: {exc}; not retrying"
-        ) from exc
-
-    with file:
-        while sent < file_size:
-            try:
-                chunk = file.read(min(CHUNK_SIZE, file_size - sent))
-            except OSError as exc:
-                raise NonRetryableUploadError(
-                    f"failed to read upload file {file_path}: {exc}; not retrying"
-                ) from exc
-            if not chunk:
-                raise NonRetryableUploadError(
-                    f"upload file changed size while reading: {file_path}; "
-                    f"expected {file_size:,} bytes, reached EOF after {sent:,} bytes; "
-                    "not retrying"
-                )
-
-            connection.send(chunk)
-            sent += len(chunk)
-            now = time.monotonic()
-            if now - last_report_at >= PROGRESS_INTERVAL_SECONDS or sent >= file_size:
-                print_progress(sent, file_size, started_at, force=sent >= file_size)
-                last_report_at = now
-
         try:
-            extra = file.read(1)
+            file = file_path.open("rb")
         except OSError as exc:
             raise NonRetryableUploadError(
-                f"failed to verify upload file size for {file_path}: {exc}; not retrying"
+                f"failed to open upload file {file_path}: {exc}; not retrying"
             ) from exc
-        if extra:
-            raise NonRetryableUploadError(
-                f"upload file grew beyond its initial size of {file_size:,} bytes "
-                f"while reading: {file_path}; not retrying"
-            )
 
-    print()
+        with file:
+            while sent < file_size:
+                try:
+                    chunk = file.read(min(CHUNK_SIZE, file_size - sent))
+                except OSError as exc:
+                    raise NonRetryableUploadError(
+                        f"failed to read upload file {file_path}: {exc}; not retrying"
+                    ) from exc
+                if not chunk:
+                    raise NonRetryableUploadError(
+                        f"upload file changed size while reading: {file_path}; "
+                        f"expected {file_size:,} bytes, reached EOF after {sent:,} bytes; "
+                        "not retrying"
+                    )
+
+                connection.send(chunk)
+                sent += len(chunk)
+                now = time.monotonic()
+                if now - last_report_at >= PROGRESS_INTERVAL_SECONDS or sent >= file_size:
+                    progress_width = print_progress(
+                        sent,
+                        file_size,
+                        started_at,
+                        force=sent >= file_size,
+                        previous_width=progress_width,
+                    )
+                    last_report_at = now
+
+            try:
+                extra = file.read(1)
+            except OSError as exc:
+                raise NonRetryableUploadError(
+                    f"failed to verify upload file size for {file_path}: {exc}; not retrying"
+                ) from exc
+            if extra:
+                raise NonRetryableUploadError(
+                    f"upload file grew beyond its initial size of {file_size:,} bytes "
+                    f"while reading: {file_path}; not retrying"
+                )
+    finally:
+        if progress_is_tty:
+            print()
 
 
-def print_progress(sent: int, total: int, started_at: float, *, force: bool = False) -> None:
-    if not force and not sys.stdout.isatty():
-        return
+def print_progress(
+    sent: int,
+    total: int,
+    started_at: float,
+    *,
+    force: bool = False,
+    previous_width: int = 0,
+) -> int:
+    is_tty = _stdout_is_tty()
+    if not force and not is_tty:
+        return previous_width
 
     elapsed = max(time.monotonic() - started_at, 0.001)
     speed = sent / elapsed
     percent = (sent / total * 100) if total else 100.0
     remaining = max(total - sent, 0)
     eta = remaining / speed if speed > 0 else 0.0
-
-    print(
-        "\r"
+    line = (
         f"progress: {percent:6.2f}% "
         f"({format_bytes(sent)} / {format_bytes(total)}, "
-        f"{format_bytes(speed)}/s, eta {format_duration(eta)})",
-        end="",
-        flush=True,
+        f"{format_bytes(speed)}/s, eta {format_duration(eta)})"
     )
+    if is_tty:
+        padding = " " * max(previous_width - len(line), 0)
+        print(f"\r{line}{padding}", end="", flush=True)
+        return len(line)
+
+    print(line, flush=True)
+    return 0
+
+
+def _stdout_is_tty() -> bool:
+    try:
+        return bool(sys.stdout.isatty())
+    except (AttributeError, OSError):
+        return False
 
 
 def format_bytes(value: float) -> str:

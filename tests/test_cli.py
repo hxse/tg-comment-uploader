@@ -1,4 +1,5 @@
 import http.client
+import io
 import json
 from pathlib import Path
 from typing import Any
@@ -8,7 +9,7 @@ import pytest
 from tg_comment_uploader.cli import (
     DEFAULT_PROFILE,
     DEFAULT_RETRIES,
-    MAX_LOCAL_BOT_API_UPLOAD_BYTES,
+    SAFE_UPLOAD_LIMIT_BYTES,
     AppConfig,
     AppError,
     BotConfig,
@@ -22,10 +23,12 @@ from tg_comment_uploader.cli import (
     load_config,
     make_bot_api_error,
     make_transport_error,
+    print_progress,
     print_upload_plan,
     render_caption,
     response_protocol_error,
     run_upload,
+    send_file_with_progress,
     send_video,
     upload_with_retries,
     validate_upload_paths,
@@ -188,6 +191,13 @@ def test_upload_parser_defaults_to_default_profile_and_five_retries() -> None:
     assert DEFAULT_RETRIES == 5
     assert args.profile == "default"
     assert args.retries == 5
+    assert args.oversize_policy == "error"
+
+
+def test_upload_parser_accepts_short_oversize_policy_alias() -> None:
+    args = build_parser().parse_args(["upload", "-o", "split", "/videos/a.mp4"])
+
+    assert args.oversize_policy == "split"
 
 
 def test_just_upload_defaults_to_five_retries() -> None:
@@ -219,9 +229,9 @@ def test_validate_upload_paths_enforces_exact_size_limit(tmp_path: Path) -> None
 
     empty.touch()
     with at_limit.open("wb") as file:
-        file.truncate(MAX_LOCAL_BOT_API_UPLOAD_BYTES)
+        file.truncate(SAFE_UPLOAD_LIMIT_BYTES)
     with oversized.open("wb") as file:
-        file.truncate(MAX_LOCAL_BOT_API_UPLOAD_BYTES + 1)
+        file.truncate(SAFE_UPLOAD_LIMIT_BYTES + 1)
 
     with pytest.raises(NonRetryableUploadError, match="upload file is empty"):
         validate_upload_paths([str(empty)])
@@ -233,9 +243,11 @@ def test_validate_upload_paths_enforces_exact_size_limit(tmp_path: Path) -> None
 
     message = str(exc_info.value)
     assert str(oversized) in message
-    assert f"{MAX_LOCAL_BOT_API_UPLOAD_BYTES + 1:,} bytes" in message
-    assert "limit=2000 MiB (2,097,152,000 bytes)" in message
-    assert "no upload was attempted" in message
+    assert f"{SAFE_UPLOAD_LIMIT_BYTES + 1:,} bytes" in message
+    assert "limit=1.9 GiB (2,000,000,000 bytes)" in message
+    assert "--oversize-policy split" in message
+    assert "--oversize-policy compress" in message
+    assert "No upload was attempted" in message
 
 
 def test_run_upload_preflights_all_sizes_before_sending(
@@ -246,7 +258,7 @@ def test_run_upload_preflights_all_sizes_before_sending(
     oversized = tmp_path / "oversized.mp4"
     first.write_bytes(b"video")
     with oversized.open("wb") as file:
-        file.truncate(MAX_LOCAL_BOT_API_UPLOAD_BYTES + 1)
+        file.truncate(SAFE_UPLOAD_LIMIT_BYTES + 1)
 
     args = build_parser().parse_args(
         [
@@ -272,7 +284,7 @@ def test_run_upload_preflights_all_sizes_before_sending(
     monkeypatch.setattr("tg_comment_uploader.cli.load_config", lambda path: fake_config())
     monkeypatch.setattr("tg_comment_uploader.cli.send_video", fake_send_video)
 
-    with pytest.raises(NonRetryableUploadError, match="no upload was attempted"):
+    with pytest.raises(NonRetryableUploadError, match="No upload was attempted"):
         run_upload(args)
 
     assert calls == 0
@@ -596,3 +608,71 @@ def test_progress_format_helpers() -> None:
     assert format_duration(0) == "0:00"
     assert format_duration(65) == "1:05"
     assert format_duration(3661) == "1:01:01"
+
+
+class ProgressStream(io.StringIO):
+    def __init__(self, *, is_tty: bool) -> None:
+        super().__init__()
+        self._is_tty = is_tty
+
+    def isatty(self) -> bool:
+        return self._is_tty
+
+
+def test_upload_progress_tty_pads_shorter_line_to_clear_residual_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = ProgressStream(is_tty=True)
+    monkeypatch.setattr("tg_comment_uploader.cli.sys.stdout", stream)
+    monkeypatch.setattr("tg_comment_uploader.cli.time.monotonic", lambda: 10.0)
+
+    width = print_progress(
+        100,
+        100,
+        0.0,
+        force=True,
+        previous_width=160,
+    )
+
+    output = stream.getvalue()
+    assert width < 160
+    assert output.startswith("\rprogress: 100.00%")
+    assert output.endswith(" " * (160 - width))
+
+
+def test_upload_progress_non_tty_is_a_complete_line_without_carriage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = ProgressStream(is_tty=False)
+    monkeypatch.setattr("tg_comment_uploader.cli.sys.stdout", stream)
+    monkeypatch.setattr("tg_comment_uploader.cli.time.monotonic", lambda: 10.0)
+
+    width = print_progress(50, 100, 0.0, force=True, previous_width=99)
+
+    assert width == 0
+    assert "\r" not in stream.getvalue()
+    assert stream.getvalue().startswith("progress:  50.00%")
+    assert stream.getvalue().endswith("\n")
+
+
+def test_upload_progress_tty_finishes_line_when_sending_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = ProgressStream(is_tty=True)
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+
+    class BrokenConnection:
+        def send(self, chunk: bytes) -> None:
+            raise RuntimeError("send failed")
+
+    monkeypatch.setattr("tg_comment_uploader.cli.sys.stdout", stream)
+    monkeypatch.setattr("tg_comment_uploader.cli.time.monotonic", lambda: 10.0)
+
+    connection: Any = BrokenConnection()
+    with pytest.raises(RuntimeError, match="send failed"):
+        send_file_with_progress(connection, video, video.stat().st_size)
+
+    assert stream.getvalue().startswith("\rprogress:")
+    assert stream.getvalue().endswith("\n")
