@@ -182,8 +182,42 @@ def test_send_media_group_treats_malformed_success_as_uncertain(
         lambda **kwargs: {"ok": True, "result": [{"message_id": 1}]},
     )
 
-    with pytest.raises(NonRetryableUploadError, match="outcome is uncertain"):
+    with pytest.raises(RetryableUploadError, match="outcome is uncertain") as exc_info:
         send_media_group(fake_config(), fake_profile(), parts, "caption")
+
+    assert exc_info.value.outcome_uncertain is True
+
+
+@pytest.mark.parametrize(
+    "invalid_result_item",
+    [
+        {},
+        {"message_id": "2"},
+        {"message_id": True},
+    ],
+    ids=["missing", "non-integer", "boolean"],
+)
+def test_send_media_group_treats_invalid_message_ids_as_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_result_item: dict[str, Any],
+) -> None:
+    parts = [tmp_path / "part-0001.mp4", tmp_path / "part-0002.mp4"]
+    for part in parts:
+        part.write_bytes(b"video")
+
+    monkeypatch.setattr(
+        "tg_comment_uploader.cli.post_json",
+        lambda **kwargs: {
+            "ok": True,
+            "result": [{"message_id": 1}, invalid_result_item],
+        },
+    )
+
+    with pytest.raises(RetryableUploadError, match="outcome is uncertain") as exc_info:
+        send_media_group(fake_config(), fake_profile(), parts, "caption")
+
+    assert exc_info.value.outcome_uncertain is True
 
 
 def test_media_group_retry_reuses_same_paths(
@@ -194,6 +228,7 @@ def test_media_group_retry_reuses_same_paths(
     for part in parts:
         part.write_bytes(b"video")
     calls: list[tuple[Path, ...]] = []
+    sleeps: list[int] = []
 
     def fake_send_media_group(
         config: AppConfig,
@@ -207,6 +242,7 @@ def test_media_group_retry_reuses_same_paths(
         return [{"message_id": 1}, {"message_id": 2}]
 
     monkeypatch.setattr("tg_comment_uploader.cli.send_media_group", fake_send_media_group)
+    monkeypatch.setattr("tg_comment_uploader.cli.time.sleep", sleeps.append)
 
     result = upload_media_groups_with_retries(
         fake_config(),
@@ -219,6 +255,7 @@ def test_media_group_retry_reuses_same_paths(
 
     assert result == [{"message_id": 1}, {"message_id": 2}]
     assert calls == [tuple(parts), tuple(parts)]
+    assert sleeps == [1]
 
 
 def test_run_upload_locked_routes_split_outputs_to_media_group(

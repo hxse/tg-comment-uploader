@@ -12,8 +12,8 @@ dev-shell:
     nix develop
 
 check:
-    uvx ruff format
-    uvx ty check
+    uv run ruff format --check
+    uv run ty check
 
 test:
     uv run pytest

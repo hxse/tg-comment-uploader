@@ -24,6 +24,11 @@ from tg_comment_uploader.media_split import (
 )
 
 
+class FailingStringIO(io.StringIO):
+    def __next__(self) -> str:
+        raise OSError("simulated stderr read failure")
+
+
 class FakePopen:
     def __init__(
         self,
@@ -142,12 +147,54 @@ def probe_payload() -> dict[str, Any]:
     }
 
 
+def compact_packet_output(payload: dict[str, Any]) -> str:
+    fields = ("stream_index", "pts_time", "dts_time", "size", "flags")
+    return "".join(
+        "|".join(f"{field}={packet[field]}" for field in fields if field in packet) + "\n"
+        for packet in payload["packets"]
+    )
+
+
+def stub_split_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, Any] | None = None,
+) -> MediaProbe:
+    probe = parse_probe_payload(payload or probe_payload())
+
+    def fake_probe(source: Path, *, ffprobe_binary: str = "ffprobe") -> MediaProbe:
+        del source, ffprobe_binary
+        return probe
+
+    monkeypatch.setattr("tg_comment_uploader.media_split.probe_media", fake_probe)
+    return probe
+
+
+def stub_packet_probe_process(
+    monkeypatch: pytest.MonkeyPatch,
+    process: FakePopen,
+) -> None:
+    payload = probe_payload()
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        assert "-show_packets" not in command
+        metadata = {"format": payload["format"], "streams": payload["streams"]}
+        return subprocess.CompletedProcess(command, 0, json.dumps(metadata), "")
+
+    monkeypatch.setattr("tg_comment_uploader.media_split.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "tg_comment_uploader.media_split.subprocess.Popen",
+        lambda *args, **kwargs: process,
+    )
+
+
 def test_parse_probe_payload_counts_all_streams_at_video_keyframes() -> None:
     probe = parse_probe_payload(probe_payload())
 
     assert probe.packet_bytes == 140
     assert probe.duration == Decimal("4.000000")
     assert probe.frame_rate == Fraction(25, 1)
+    assert probe.video_stream_index == 0
     assert probe.points == (
         SplitPoint(Decimal(0), 0),
         SplitPoint(Decimal("2.000000"), 70),
@@ -161,8 +208,158 @@ def test_parse_probe_payload_rejects_missing_internal_video_keyframes() -> None:
         if packet["stream_index"] == 0 and packet["pts_time"] != "0.000000":
             packet["flags"] = "___"
 
-    with pytest.raises(MediaSplitError, match="no internal video keyframes"):
+    with pytest.raises(MediaSplitError, match="internal video keyframes"):
         parse_probe_payload(payload)
+
+
+def test_probe_media_streams_compact_packets_and_skips_attached_picture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = probe_payload()
+    real_video = payload["streams"][0]
+    real_video["index"] = 2
+    real_video["disposition"] = {"attached_pic": 0}
+    payload["streams"].insert(
+        0,
+        {
+            "index": 0,
+            "codec_type": "video",
+            "avg_frame_rate": "0/0",
+            "r_frame_rate": "0/0",
+            "disposition": {"attached_pic": 1},
+        },
+    )
+    for packet in payload["packets"]:
+        if packet["stream_index"] == 0:
+            packet["stream_index"] = 2
+
+    metadata_commands: list[list[str]] = []
+    packet_commands: list[list[str]] = []
+    process = FakePopen(stdout=compact_packet_output(payload))
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        metadata_commands.append(command)
+        assert kwargs["stdin"] is subprocess.DEVNULL
+        assert "-show_packets" not in command
+        metadata = {"format": payload["format"], "streams": payload["streams"]}
+        return subprocess.CompletedProcess(command, 0, json.dumps(metadata), "")
+
+    def fake_popen(command: list[str], **kwargs: Any) -> FakePopen:
+        packet_commands.append(command)
+        assert kwargs["stdin"] is subprocess.DEVNULL
+        assert kwargs["stdout"] is subprocess.PIPE
+        assert kwargs["stderr"] is subprocess.PIPE
+        return process
+
+    monkeypatch.setattr("tg_comment_uploader.media_split.subprocess.run", fake_run)
+    monkeypatch.setattr("tg_comment_uploader.media_split.subprocess.Popen", fake_popen)
+
+    probe = probe_media(Path("/videos/source.mp4"))
+
+    assert probe.video_stream_index == 2
+    assert probe.packet_bytes == 140
+    assert probe.points[1] == SplitPoint(Decimal("2.000000"), 70)
+    assert len(metadata_commands) == 1
+    assert (
+        "stream_disposition=attached_pic"
+        in metadata_commands[0][metadata_commands[0].index("-show_entries") + 1]
+    )
+    assert len(packet_commands) == 1
+    assert packet_commands[0][packet_commands[0].index("-of") + 1] == "compact=p=0:nk=0"
+    assert "-print_format" not in packet_commands[0]
+    assert process.wait_calls == 1
+
+
+def test_probe_media_reports_ffprobe_failure_instead_of_empty_packet_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakePopen(
+        stdout="",
+        stderr="disk read failed while probing packets\n",
+        returncode=2,
+    )
+    stub_packet_probe_process(monkeypatch, process)
+
+    with pytest.raises(MediaSplitError) as exc_info:
+        probe_media(Path("/videos/source.mp4"))
+
+    message = str(exc_info.value)
+    assert "exit code 2" in message
+    assert "disk read failed while probing packets" in message
+    assert "does not contain media packets" not in message
+    assert process.wait_calls == 1
+    assert process.terminate_calls == 0
+
+
+def test_probe_media_reports_ffprobe_failure_after_malformed_first_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakePopen(
+        stdout="malformed compact packet\nignored=remaining output\n",
+        stderr="input/output error from ffprobe\n",
+        returncode=1,
+    )
+    stub_packet_probe_process(monkeypatch, process)
+
+    with pytest.raises(MediaSplitError) as exc_info:
+        probe_media(Path("/videos/source.mp4"))
+
+    message = str(exc_info.value)
+    assert "exit code 1" in message
+    assert "input/output error from ffprobe" in message
+    assert "invalid compact output" not in message
+    assert process.wait_calls == 1
+    assert process.terminate_calls == 0
+
+
+def test_probe_media_preserves_empty_packet_error_when_ffprobe_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakePopen(stdout="", returncode=0)
+    stub_packet_probe_process(monkeypatch, process)
+
+    with pytest.raises(MediaSplitError, match="does not contain media packets"):
+        probe_media(Path("/videos/source.mp4"))
+
+    assert process.wait_calls == 1
+    assert process.terminate_calls == 0
+
+
+def test_probe_media_preserves_malformed_packet_error_when_ffprobe_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakePopen(
+        stdout="malformed compact packet\nignored=remaining output\n",
+        returncode=0,
+    )
+    stub_packet_probe_process(monkeypatch, process)
+
+    with pytest.raises(MediaSplitError, match="packet 1 has invalid compact output"):
+        probe_media(Path("/videos/source.mp4"))
+
+    assert process.stdout.tell() == len(process.stdout.getvalue())
+    assert process.wait_calls == 1
+    assert process.terminate_calls == 0
+
+
+def test_probe_media_preserves_nonzero_exit_when_stderr_reader_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakePopen(stdout="", returncode=7)
+    process.stderr = FailingStringIO()
+    stub_packet_probe_process(monkeypatch, process)
+
+    with pytest.raises(MediaSplitError) as exc_info:
+        probe_media(Path("/videos/source.mp4"))
+
+    message = str(exc_info.value)
+    assert "ffprobe failed" in message
+    assert "exit code 7" in message
+    assert "diagnostic stream read failed" in message
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert process.stderr.closed
+    assert process.wait_calls == 1
+    assert process.terminate_calls == 0
 
 
 def test_probe_media_reports_missing_ffprobe_with_dev_shell_hint(
@@ -252,6 +449,7 @@ def test_build_segment_command_is_argument_array_and_disables_stdin() -> None:
         source,
         output,
         plan,
+        video_stream_index=2,
         ffmpeg_binary="/nix/store/ffmpeg/bin/ffmpeg",
         frame_rate=Fraction(25, 1),
     )
@@ -262,7 +460,7 @@ def test_build_segment_command_is_argument_array_and_disables_stdin() -> None:
     assert command[command.index("-i") + 1] == str(source)
     assert command[command.index("-segment_times") + 1] == "1.25,2.5"
     assert command[command.index("-segment_time_delta") + 1] == "0.02"
-    assert command[command.index("-reference_stream") + 1] == "v:0"
+    assert command[command.index("-reference_stream") + 1] == "2"
     assert command[-1] == str(output)
 
 
@@ -304,6 +502,7 @@ def test_split_video_streams_structured_progress_from_ffmpeg(
         Path(pattern % 2).write_bytes(b"b" * 75)
         return process
 
+    stub_split_probe(monkeypatch)
     monkeypatch.setattr("tg_comment_uploader.media_split.subprocess.run", fake_run)
     monkeypatch.setattr("tg_comment_uploader.media_split.subprocess.Popen", fake_popen)
 
@@ -359,6 +558,7 @@ def test_split_video_interrupt_terminates_and_reaps_ffmpeg(
         if event.stage == "splitting":
             raise KeyboardInterrupt
 
+    stub_split_probe(monkeypatch)
     monkeypatch.setattr("tg_comment_uploader.media_split.subprocess.run", fake_run)
     monkeypatch.setattr("tg_comment_uploader.media_split.subprocess.Popen", fake_popen)
 
@@ -397,6 +597,7 @@ def test_split_video_preserves_ffmpeg_stderr_diagnostic(
         del kwargs
         return subprocess.CompletedProcess(command, 0, json.dumps(probe_payload()), "")
 
+    stub_split_probe(monkeypatch)
     monkeypatch.setattr("tg_comment_uploader.media_split.subprocess.run", fake_run)
     monkeypatch.setattr(
         "tg_comment_uploader.media_split.subprocess.Popen",
@@ -453,6 +654,7 @@ def test_split_video_runs_stream_copy_and_validates_every_part(
         Path(pattern % 2).write_bytes(b"b" * 75)
         return subprocess.CompletedProcess(command, 0, "", "")
 
+    stub_split_probe(monkeypatch)
     monkeypatch.setattr("tg_comment_uploader.media_split.subprocess.run", fake_run)
     monkeypatch.setattr("tg_comment_uploader.media_split._run_ffmpeg", fake_ffmpeg)
 
@@ -468,7 +670,7 @@ def test_split_video_runs_stream_copy_and_validates_every_part(
         work_dir / "source.final 100% [x] part-0001.mp4",
         work_dir / "source.final 100% [x] part-0002.mp4",
     )
-    assert sum(command[0] == "ffprobe" for command in commands) == 3
+    assert sum(command[0] == "ffprobe" for command in commands) == 2
     ffmpeg_command = next(command for command in commands if command[0] == "ffmpeg")
     assert "-nostdin" in ffmpeg_command
     assert ffmpeg_command[ffmpeg_command.index("-i") + 1] == str(source)
@@ -528,6 +730,7 @@ def test_split_video_replans_all_parts_after_actual_size_exceeds_limit(
             Path(pattern % index).write_bytes(b"x" * size)
         return subprocess.CompletedProcess(command, 0, "", "")
 
+    stub_split_probe(monkeypatch, payload)
     monkeypatch.setattr("tg_comment_uploader.media_split.subprocess.run", fake_run)
     monkeypatch.setattr("tg_comment_uploader.media_split._run_ffmpeg", fake_ffmpeg)
 
@@ -570,6 +773,7 @@ def test_split_video_removes_outputs_when_validation_fails(
         Path(pattern % 2).write_bytes(b"b" * 75)
         return subprocess.CompletedProcess(command, 0, "", "")
 
+    stub_split_probe(monkeypatch)
     monkeypatch.setattr("tg_comment_uploader.media_split.subprocess.run", fake_run)
     monkeypatch.setattr("tg_comment_uploader.media_split._run_ffmpeg", fake_ffmpeg)
 
@@ -603,14 +807,23 @@ def test_split_video_with_real_ffmpeg(tmp_path: Path) -> None:
             "-f",
             "lavfi",
             "-i",
+            "sine=frequency=1000:duration=4",
+            "-f",
+            "lavfi",
+            "-i",
             "testsrc=size=64x64:rate=10:duration=4",
+            "-map",
+            "0:a",
+            "-map",
+            "1:v",
+            "-c:a",
+            "aac",
             "-c:v",
             "mpeg4",
             "-g",
             "5",
             "-q:v",
             "5",
-            "-an",
             str(source),
         ],
         check=True,
@@ -618,6 +831,9 @@ def test_split_video_with_real_ffmpeg(tmp_path: Path) -> None:
     )
     source_size = source.stat().st_size
     events: list[SplitProgress] = []
+
+    media_probe = probe_media(source, ffprobe_binary=ffprobe)
+    assert media_probe.video_stream_index == 1
 
     result = split_video(
         source,

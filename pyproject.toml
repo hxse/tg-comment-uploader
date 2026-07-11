@@ -11,6 +11,8 @@ tg-comment-uploader = "tg_comment_uploader.cli:main"
 [dependency-groups]
 dev = [
   "pytest>=8.4.0",
+  "ruff==0.15.21",
+  "ty==0.0.58",
 ]
 
 [build-system]

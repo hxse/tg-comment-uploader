@@ -9,7 +9,7 @@ from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
 from threading import Thread
-from typing import Any, Callable, Literal, Mapping, Sequence, TextIO, cast
+from typing import Any, Callable, Iterable, Literal, Mapping, Sequence, TextIO
 
 
 SplitStage = Literal["probing", "planning", "splitting", "validating"]
@@ -35,6 +35,7 @@ class MediaProbe:
     packet_bytes: int
     duration: Decimal
     frame_rate: Fraction | None
+    video_stream_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -77,14 +78,6 @@ class SplitProgress:
 SplitProgressCallback = Callable[[SplitProgress], None]
 
 
-@dataclass(frozen=True)
-class _Packet:
-    timestamp: Decimal
-    size: int
-    stream_index: int
-    keyframe: bool
-
-
 class _PartsOverLimit(Exception):
     def __init__(self, sizes: tuple[int, ...]) -> None:
         super().__init__("one or more generated parts exceed the hard limit")
@@ -92,109 +85,19 @@ class _PartsOverLimit(Exception):
 
 
 def parse_probe_payload(payload: Mapping[str, Any]) -> MediaProbe:
-    """Convert ffprobe JSON into cumulative byte positions at video keyframes."""
+    """Convert an in-memory ffprobe payload using the streaming packet accumulator."""
 
-    streams = payload.get("streams")
-    if not isinstance(streams, list):
-        raise MediaSplitError("ffprobe response does not contain a streams array")
-
-    video_stream: Mapping[str, Any] | None = None
-    for raw_stream in streams:
-        if isinstance(raw_stream, Mapping) and raw_stream.get("codec_type") == "video":
-            video_stream = raw_stream
-            break
-    if video_stream is None:
-        raise MediaSplitError("source does not contain a video stream")
-
+    video_stream, format_section = _parse_probe_metadata(payload)
     video_stream_index = _strict_int(video_stream.get("index"), "video stream index")
-    frame_rate = _parse_frame_rate(video_stream)
 
     raw_packets = payload.get("packets")
     if not isinstance(raw_packets, list) or not raw_packets:
         raise MediaSplitError("ffprobe response does not contain media packets")
-
-    packets: list[_Packet] = []
-    for packet_number, raw_packet in enumerate(raw_packets, start=1):
-        if not isinstance(raw_packet, Mapping):
-            raise MediaSplitError(f"ffprobe packet {packet_number} is not an object")
-        packet_mapping = cast(Mapping[str, Any], raw_packet)
-
-        timestamp = _packet_timestamp(packet_mapping, packet_number)
-        size = _positive_int(packet_mapping.get("size"), f"packet {packet_number} size")
-        stream_index = _strict_int(
-            packet_mapping.get("stream_index"), f"packet {packet_number} stream index"
-        )
-        flags = packet_mapping.get("flags", "")
-        if not isinstance(flags, str):
-            raise MediaSplitError(f"ffprobe packet {packet_number} flags are invalid")
-        packets.append(
-            _Packet(
-                timestamp=timestamp,
-                size=size,
-                stream_index=stream_index,
-                keyframe="K" in flags,
-            )
-        )
-
-    format_section = payload.get("format")
-    if not isinstance(format_section, Mapping):
-        format_section = {}
-    start_time = _optional_decimal(format_section.get("start_time"))
-    if start_time is None:
-        start_time = min(Decimal(0), min(packet.timestamp for packet in packets))
-
-    normalized_packets = tuple(
-        _Packet(
-            timestamp=packet.timestamp - start_time,
-            size=packet.size,
-            stream_index=packet.stream_index,
-            keyframe=packet.keyframe,
-        )
-        for packet in packets
-    )
-    duration = _probe_duration(format_section, normalized_packets)
-
-    keyframe_times = sorted(
-        {
-            packet.timestamp
-            for packet in normalized_packets
-            if packet.stream_index == video_stream_index
-            and packet.keyframe
-            and Decimal(0) < packet.timestamp < duration
-        }
-    )
-    if not keyframe_times:
-        raise MediaSplitError(
-            "source has no internal video keyframes suitable for lossless splitting; "
-            "use --oversize-policy compress"
-        )
-
-    packets_by_time = sorted(normalized_packets, key=lambda packet: packet.timestamp)
-    packet_times = [packet.timestamp for packet in packets_by_time]
-    prefix_bytes = [0]
-    for packet in packets_by_time:
-        prefix_bytes.append(prefix_bytes[-1] + packet.size)
-    packet_bytes = prefix_bytes[-1]
-
-    points: list[SplitPoint] = [SplitPoint(Decimal(0), 0)]
-    for timestamp in keyframe_times:
-        packet_index = bisect.bisect_left(packet_times, timestamp)
-        cumulative_bytes = prefix_bytes[packet_index]
-        if cumulative_bytes <= points[-1].cumulative_bytes or cumulative_bytes >= packet_bytes:
-            continue
-        points.append(SplitPoint(timestamp, cumulative_bytes))
-    points.append(SplitPoint(duration, packet_bytes))
-
-    if len(points) < 3:
-        raise MediaSplitError(
-            "source has no usable internal video keyframes for lossless splitting; "
-            "use --oversize-policy compress"
-        )
-    return MediaProbe(
-        points=tuple(points),
-        packet_bytes=packet_bytes,
-        duration=duration,
-        frame_rate=frame_rate,
+    return _accumulate_packets(
+        raw_packets,
+        video_stream_index=video_stream_index,
+        frame_rate=_parse_frame_rate(video_stream),
+        format_section=format_section,
     )
 
 
@@ -266,6 +169,7 @@ def build_segment_command(
     output_pattern: Path,
     plan: SplitPlan,
     *,
+    video_stream_index: int = 0,
     ffmpeg_binary: str = "ffmpeg",
     frame_rate: Fraction | None = None,
 ) -> list[str]:
@@ -273,6 +177,8 @@ def build_segment_command(
 
     if not plan.split_times:
         raise ValueError("a split command requires at least one split time")
+    if video_stream_index < 0:
+        raise ValueError("video_stream_index must not be negative")
 
     command = [
         ffmpeg_binary,
@@ -290,7 +196,7 @@ def build_segment_command(
         "-f",
         "segment",
         "-reference_stream",
-        "v:0",
+        str(video_stream_index),
         "-segment_start_number",
         "1",
         "-segment_times",
@@ -371,6 +277,7 @@ def split_video(
             source,
             output_pattern,
             plan,
+            video_stream_index=probe.video_stream_index,
             ffmpeg_binary=ffmpeg_binary,
             frame_rate=probe.frame_rate,
         )
@@ -432,7 +339,7 @@ def split_video(
 
 
 def probe_media(source: Path, *, ffprobe_binary: str = "ffprobe") -> MediaProbe:
-    command = [
+    metadata_command = [
         ffprobe_binary,
         "-v",
         "error",
@@ -440,21 +347,246 @@ def probe_media(source: Path, *, ffprobe_binary: str = "ffprobe") -> MediaProbe:
         "json",
         "-show_format",
         "-show_streams",
-        "-show_packets",
         "-show_entries",
         (
             "format=start_time,duration:"
             "stream=index,codec_type,avg_frame_rate,r_frame_rate:"
-            "packet=stream_index,pts_time,dts_time,duration_time,size,flags"
+            "stream_disposition=attached_pic"
         ),
         str(source),
     ]
-    completed = _run_command(command)
+    completed = _run_command(metadata_command)
     if completed.returncode != 0:
         detail = completed.stderr.strip() or "no diagnostic output"
         raise MediaSplitError(f"ffprobe failed for {source}: {detail}")
     payload = _parse_json_object(completed.stdout, context=f"ffprobe output for {source}")
-    return parse_probe_payload(payload)
+    video_stream, format_section = _parse_probe_metadata(payload)
+    video_stream_index = _strict_int(video_stream.get("index"), "video stream index")
+
+    packet_command = [
+        ffprobe_binary,
+        "-v",
+        "error",
+        "-show_packets",
+        "-show_entries",
+        "packet=stream_index,pts_time,dts_time,size,flags",
+        "-of",
+        "compact=p=0:nk=0",
+        str(source),
+    ]
+    return _probe_packet_stream(
+        packet_command,
+        source=source,
+        video_stream_index=video_stream_index,
+        frame_rate=_parse_frame_rate(video_stream),
+        format_section=format_section,
+    )
+
+
+def _parse_probe_metadata(
+    payload: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    streams = payload.get("streams")
+    if not isinstance(streams, list):
+        raise MediaSplitError("ffprobe response does not contain a streams array")
+
+    for raw_stream in streams:
+        if not isinstance(raw_stream, Mapping):
+            continue
+        if raw_stream.get("codec_type") != "video":
+            continue
+        if _is_attached_picture(raw_stream):
+            continue
+        video_stream = raw_stream
+        break
+    else:
+        raise MediaSplitError("source does not contain a usable non-attached video stream")
+
+    format_section = payload.get("format")
+    if not isinstance(format_section, Mapping):
+        format_section = {}
+    return video_stream, format_section
+
+
+def _is_attached_picture(stream: Mapping[str, Any]) -> bool:
+    disposition = stream.get("disposition")
+    return isinstance(disposition, Mapping) and disposition.get("attached_pic") == 1
+
+
+def _probe_packet_stream(
+    command: list[str],
+    *,
+    source: Path,
+    video_stream_index: int,
+    frame_rate: Fraction | None,
+    format_section: Mapping[str, Any],
+) -> MediaProbe:
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+    except FileNotFoundError as exc:
+        raise MediaSplitError(
+            f"required media tool {command[0]!r} was not found; run `just dev-shell` and retry"
+        ) from exc
+    except OSError as exc:
+        raise MediaSplitError(f"failed to execute {command[0]!r}: {exc}") from exc
+
+    stderr_lines: deque[str] = deque(maxlen=200)
+    stderr_errors: list[BaseException] = []
+    stderr_thread: Thread | None = None
+    probe: MediaProbe | None = None
+    parse_error: MediaSplitError | None = None
+    try:
+        if process.stdout is None or process.stderr is None:
+            raise MediaSplitError("ffprobe output pipes were not created")
+        stderr_thread = Thread(
+            target=_drain_stderr,
+            args=(process.stderr, stderr_lines, stderr_errors),
+            name="tg-comment-uploader-ffprobe-stderr",
+            daemon=True,
+        )
+        stderr_thread.start()
+        try:
+            probe = _accumulate_packets(
+                _iter_compact_packets(process.stdout),
+                video_stream_index=video_stream_index,
+                frame_rate=frame_rate,
+                format_section=format_section,
+            )
+        except MediaSplitError as exc:
+            parse_error = exc
+            # Keep consuming stdout so ffprobe cannot block on a full pipe. Its final
+            # exit status and stderr are more useful when the probe itself failed.
+            for _ in process.stdout:
+                pass
+        return_code = process.wait()
+    except BaseException:
+        try:
+            _terminate_process(process)
+        finally:
+            if stderr_thread is not None:
+                stderr_thread.join()
+        raise
+
+    if stderr_thread is not None:
+        stderr_thread.join()
+    if return_code != 0:
+        detail = "\n".join(stderr_lines).strip()
+        if not detail and stderr_errors:
+            detail = f"diagnostic stream read failed: {stderr_errors[0]}"
+        if not detail:
+            detail = "no diagnostic output"
+        failure = MediaSplitError(
+            f"ffprobe failed for {source} with exit code {return_code}: {detail}"
+        )
+        if stderr_errors:
+            raise failure from stderr_errors[0]
+        raise failure
+    if parse_error is not None:
+        raise parse_error
+    if stderr_errors:
+        error = stderr_errors[0]
+        raise MediaSplitError(f"failed to read ffprobe diagnostics: {error}") from error
+    if probe is None:
+        raise AssertionError("successful ffprobe packet stream produced no probe result")
+    return probe
+
+
+def _iter_compact_packets(stream: Iterable[str]) -> Iterable[Mapping[str, Any]]:
+    packet_number = 0
+    for raw_line in stream:
+        line = raw_line.rstrip("\r\n")
+        if not line:
+            continue
+        packet_number += 1
+        fields: dict[str, Any] = {}
+        for item in line.split("|"):
+            key, separator, value = item.partition("=")
+            if not separator or not key or key in fields:
+                raise MediaSplitError(f"ffprobe packet {packet_number} has invalid compact output")
+            fields[key] = value
+        yield fields
+
+
+def _accumulate_packets(
+    packets: Iterable[Any],
+    *,
+    video_stream_index: int,
+    frame_rate: Fraction | None,
+    format_section: Mapping[str, Any],
+) -> MediaProbe:
+    packet_bytes = 0
+    packet_count = 0
+    minimum_timestamp: Decimal | None = None
+    maximum_timestamp: Decimal | None = None
+    raw_keyframes: list[SplitPoint] = []
+
+    for packet_number, raw_packet in enumerate(packets, start=1):
+        if not isinstance(raw_packet, Mapping):
+            raise MediaSplitError(f"ffprobe packet {packet_number} is not an object")
+        timestamp = _packet_timestamp(raw_packet, packet_number)
+        size = _positive_int(raw_packet.get("size"), f"packet {packet_number} size")
+        stream_index = _strict_int(
+            raw_packet.get("stream_index"), f"packet {packet_number} stream index"
+        )
+        flags = raw_packet.get("flags", "")
+        if not isinstance(flags, str):
+            raise MediaSplitError(f"ffprobe packet {packet_number} flags are invalid")
+
+        if stream_index == video_stream_index and "K" in flags:
+            raw_keyframes.append(SplitPoint(timestamp, packet_bytes))
+        packet_bytes += size
+        packet_count += 1
+        if minimum_timestamp is None or timestamp < minimum_timestamp:
+            minimum_timestamp = timestamp
+        if maximum_timestamp is None or timestamp > maximum_timestamp:
+            maximum_timestamp = timestamp
+
+    if packet_count == 0 or minimum_timestamp is None or maximum_timestamp is None:
+        raise MediaSplitError("ffprobe response does not contain media packets")
+
+    start_time = _optional_decimal(format_section.get("start_time"))
+    if start_time is None:
+        start_time = min(Decimal(0), minimum_timestamp)
+    packet_end = maximum_timestamp - start_time
+    duration = _probe_duration(format_section, packet_end)
+
+    points: list[SplitPoint] = [SplitPoint(Decimal(0), 0)]
+    raw_keyframes.sort(
+        key=lambda point: (point.timestamp, point.cumulative_bytes),
+    )
+    for raw_point in raw_keyframes:
+        timestamp = raw_point.timestamp - start_time
+        if timestamp <= points[-1].timestamp or timestamp >= duration:
+            continue
+        if (
+            raw_point.cumulative_bytes <= points[-1].cumulative_bytes
+            or raw_point.cumulative_bytes >= packet_bytes
+        ):
+            continue
+        points.append(SplitPoint(timestamp, raw_point.cumulative_bytes))
+    points.append(SplitPoint(duration, packet_bytes))
+
+    if len(points) < 3:
+        raise MediaSplitError(
+            "source has no usable internal video keyframes for lossless splitting; "
+            "use --oversize-policy compress"
+        )
+    return MediaProbe(
+        points=tuple(points),
+        packet_bytes=packet_bytes,
+        duration=duration,
+        frame_rate=frame_rate,
+        video_stream_index=video_stream_index,
+    )
 
 
 def _validate_split_request(
@@ -593,10 +725,9 @@ def _keyframe_error(required_parts: int, available_parts: int) -> MediaSplitErro
 
 def _probe_duration(
     format_section: Mapping[str, Any],
-    packets: Sequence[_Packet],
+    packet_end: Decimal,
 ) -> Decimal:
     duration = _optional_decimal(format_section.get("duration"))
-    packet_end = max(packet.timestamp for packet in packets)
     if duration is None or duration <= packet_end:
         duration = packet_end + Decimal("0.000001")
     if duration <= 0:
@@ -831,6 +962,10 @@ def _drain_stderr(
             lines.append(raw_line.rstrip("\r\n"))
     except BaseException as exc:
         errors.append(exc)
+        try:
+            stream.close()
+        except BaseException as close_error:
+            errors.append(close_error)
 
 
 def _terminate_process(process: subprocess.Popen[str]) -> None:

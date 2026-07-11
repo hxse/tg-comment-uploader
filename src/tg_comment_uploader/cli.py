@@ -5,8 +5,11 @@ import errno
 import http.client
 import json
 import mimetypes
+import os
+import re
 import signal
 import shutil
+import stat
 import socket
 import subprocess
 import sys
@@ -16,8 +19,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from string import Formatter
-from typing import Any, TypeVar, cast
+from typing import Any, BinaryIO, TypeVar, cast
 
 from .locking import UploadLockError, upload_instance_lock
 from .media_compress import CompressionProgress
@@ -39,7 +41,14 @@ OVERSIZE_POLICY_HINT = (
     "--oversize-policy compress for lossy compression."
 )
 MEDIA_GROUP_MAX_ITEMS = 10
+RETRY_BACKOFF_INITIAL_SECONDS = 1
+RETRY_BACKOFF_MAX_SECONDS = 30
 MAX_RETRY_AFTER_SECONDS = 24 * 60 * 60
+MAX_UNTRUSTED_ERROR_TEXT_LENGTH = 500
+BOT_TOKEN_PATH_PATTERN = re.compile(
+    r"/bot[^/?#\s]+(?=/|[?#\s]|$)",
+    re.IGNORECASE,
+)
 
 UploadResultT = TypeVar("UploadResultT")
 TRANSIENT_NETWORK_ERRNOS = {
@@ -61,11 +70,18 @@ class AppError(Exception):
 
 
 class RetryableUploadError(AppError):
-    """Transient upload failure that may succeed when attempted again."""
+    """Upload failure retried under the CLI's at-least-once delivery policy."""
 
-    def __init__(self, message: str, *, retry_after_seconds: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: int | None = None,
+        outcome_uncertain: bool = False,
+    ) -> None:
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
+        self.outcome_uncertain = outcome_uncertain
 
 
 class NonRetryableUploadError(AppError):
@@ -183,14 +199,17 @@ def run_server(args: argparse.Namespace) -> int:
     if binary is None:
         raise AppError(f"telegram Bot API server binary not found: {server.binary}")
 
-    server.work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        server.work_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name == "posix":
+            server.work_dir.chmod(0o700)
+    except OSError as exc:
+        raise AppError(
+            f"failed to prepare private Bot API working directory {server.work_dir}: {exc}"
+        ) from exc
 
     command = [
         binary,
-        "--api-id",
-        str(config.bot.api_id),
-        "--api-hash",
-        config.bot.api_hash,
         "--local",
         "--http-ip-address",
         server.host,
@@ -198,9 +217,17 @@ def run_server(args: argparse.Namespace) -> int:
         str(server.port),
     ]
 
+    child_env = os.environ.copy()
+    child_env["TELEGRAM_API_ID"] = str(config.bot.api_id)
+    child_env["TELEGRAM_API_HASH"] = config.bot.api_hash
     print(f"starting {server.binary} on http://{server.host}:{server.port}")
     print(f"working directory: {server.work_dir}")
-    return subprocess.run(command, cwd=server.work_dir, check=False).returncode
+    return subprocess.run(
+        command,
+        cwd=server.work_dir,
+        env=child_env,
+        check=False,
+    ).returncode
 
 
 def run_upload(args: argparse.Namespace) -> int:
@@ -221,12 +248,18 @@ def prepared_media_target_bytes(policy: OversizePolicy) -> int:
 
 def run_upload_locked(args: argparse.Namespace) -> int:
     config = load_config(args.config)
+    if config.server.host not in LOCAL_HOSTS:
+        raise AppError(
+            "refuse to send Bot token or upload files to non-local Bot API server: "
+            f"{config.server.host!r}"
+        )
     profile = get_profile(config, args.profile)
     oversize_policy = cast(OversizePolicy, args.oversize_policy)
     files = validate_upload_paths(
         args.paths,
         allow_oversized=oversize_policy != "error",
     )
+    captions = [render_caption(profile.caption, path) for path in files]
 
     print_upload_plan(
         args.profile,
@@ -235,10 +268,9 @@ def run_upload_locked(args: argparse.Namespace) -> int:
         oversize_policy=oversize_policy,
     )
 
-    for index, path in enumerate(files, start=1):
+    for index, (path, caption) in enumerate(zip(files, captions, strict=True), start=1):
         prefix = f"[{index}/{len(files)}]"
         renderer = TerminalProgress()
-        caption = render_caption(profile.caption, path)
         try:
             renderer.log(f"{prefix} uploading: {path}")
             try:
@@ -357,6 +389,12 @@ def load_config(path: Path) -> AppConfig:
     if not path.is_file():
         raise AppError(f"config path is not a file: {path}")
 
+    if os.name == "posix":
+        try:
+            path.chmod(0o600)
+        except OSError as exc:
+            raise AppError(f"failed to secure config file {path} with mode 0600: {exc}") from exc
+
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -464,6 +502,37 @@ def get_upload_file_size(path: Path) -> int:
         ) from exc
 
 
+def open_upload_file(path: Path) -> tuple[BinaryIO, int]:
+    try:
+        upload_file = path.open("rb")
+    except OSError as exc:
+        raise NonRetryableUploadError(
+            f"failed to open upload file {path}: {exc}; not retrying"
+        ) from exc
+
+    try:
+        try:
+            metadata = os.fstat(upload_file.fileno())
+        except OSError as exc:
+            raise NonRetryableUploadError(
+                f"failed to read upload file metadata for {path}: {exc}; not retrying"
+            ) from exc
+        if not stat.S_ISREG(metadata.st_mode):
+            raise NonRetryableUploadError(
+                f"upload path is not a regular file: {path}; not retrying"
+            )
+        file_size = metadata.st_size
+        validate_upload_file_size(path, file_size)
+    except BaseException:
+        try:
+            upload_file.close()
+        except OSError:
+            pass
+        raise
+
+    return upload_file, file_size
+
+
 def validate_upload_file_size(path: Path, file_size: int) -> None:
     if file_size == 0:
         raise NonRetryableUploadError(f"upload file is empty: {path}; no upload was attempted")
@@ -501,6 +570,7 @@ def print_upload_plan(
 
 
 def render_caption(template: str, path: Path) -> str:
+    validate_caption_template_shape(template, context="caption template")
     values = {
         "name": path.name,
         "stem": path.stem,
@@ -510,22 +580,43 @@ def render_caption(template: str, path: Path) -> str:
     }
     try:
         return template.format(**values)
-    except KeyError as exc:
-        key = exc.args[0]
-        raise AppError(f"unknown caption placeholder: {{{key}}}") from exc
+    except (KeyError, IndexError, AttributeError, ValueError) as exc:
+        raise AppError(f"failed to render caption template {template!r}: {exc}") from exc
 
 
 def validate_caption_template(template: str, profile_name: str) -> None:
+    validate_caption_template_shape(
+        template,
+        context=f"profiles.{profile_name}.caption",
+    )
+
+
+def validate_caption_template_shape(template: str, *, context: str) -> None:
     allowed = {"name", "stem", "suffix", "parent", "path"}
-    for _, field_name, _, _ in Formatter().parse(template):
-        if field_name is None:
+    index = 0
+    while index < len(template):
+        character = template[index]
+        if character == "{":
+            if index + 1 < len(template) and template[index + 1] == "{":
+                index += 2
+                continue
+            closing = template.find("}", index + 1)
+            if closing < 0:
+                raise AppError(f"{context} is invalid: unmatched '{{' at position {index}")
+            field_name = template[index + 1 : closing]
+            if field_name not in allowed:
+                raise AppError(
+                    f"{context} contains unsupported placeholder {{{field_name}}}; "
+                    f"allowed exact fields: {', '.join(sorted(allowed))}"
+                )
+            index = closing + 1
             continue
-        root = field_name.split(".", 1)[0].split("[", 1)[0]
-        if root not in allowed:
-            raise AppError(
-                f"profiles.{profile_name}.caption contains unknown placeholder {{{field_name}}}; "
-                f"allowed: {', '.join(sorted(allowed))}"
-            )
+        if character == "}":
+            if index + 1 < len(template) and template[index + 1] == "}":
+                index += 2
+                continue
+            raise AppError(f"{context} is invalid: unmatched '}}' at position {index}")
+        index += 1
 
 
 def send_video(
@@ -561,10 +652,10 @@ def send_video(
         raise make_bot_api_error(response, http_status=None, file_path=path)
 
     result = response.get("result")
-    if not isinstance(result, dict):
-        raise NonRetryableUploadError(
+    if not isinstance(result, dict) or not is_message_id(result.get("message_id")):
+        raise uncertain_upload_error(
             f"upload outcome is uncertain for {path}: "
-            "Bot API reported success without a result object; not retrying to avoid duplicates"
+            "Bot API reported success without a valid message ID"
         )
     return result
 
@@ -634,13 +725,17 @@ def send_media_group(
         not isinstance(result, list)
         or len(result) != len(paths)
         or not all(isinstance(item, dict) for item in result)
+        or not all(is_message_id(item.get("message_id")) for item in result)
     ):
-        raise NonRetryableUploadError(
+        raise uncertain_upload_error(
             f"upload outcome is uncertain for media group starting with {paths[0]}: "
-            "Bot API reported success without the expected message list; "
-            "not retrying to avoid duplicates"
+            "Bot API reported success without the expected valid message IDs"
         )
     return cast(list[dict[str, Any]], result)
+
+
+def is_message_id(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def partition_media_groups(paths: Sequence[Path]) -> tuple[tuple[Path, ...], ...]:
@@ -732,17 +827,34 @@ def retry_upload(
             if attempt >= attempts:
                 break
             print(f"attempt {attempt}/{attempts} failed: {exc}", file=sys.stderr)
-            if exc.retry_after_seconds is not None and exc.retry_after_seconds > 0:
+            if exc.outcome_uncertain:
                 print(
-                    f"waiting {exc.retry_after_seconds}s before retrying",
+                    "WARNING: the previous upload may already have succeeded; retrying may "
+                    "create duplicate Telegram messages or media groups",
                     file=sys.stderr,
                 )
-                time.sleep(exc.retry_after_seconds)
+            delay = retry_delay_seconds(exc, failed_attempt=attempt)
+            delay_source = (
+                "Bot API retry_after"
+                if exc.retry_after_seconds is not None
+                else "exponential backoff"
+            )
+            print(f"waiting {delay}s before retrying ({delay_source})", file=sys.stderr)
+            time.sleep(delay)
 
     assert last_error is not None
     raise AppError(
         f"upload failed after {attempts} attempts for {label}: {last_error}"
     ) from last_error
+
+
+def retry_delay_seconds(error: RetryableUploadError, *, failed_attempt: int) -> int:
+    if error.retry_after_seconds is not None:
+        return error.retry_after_seconds
+
+    exponent = min(max(failed_attempt - 1, 0), 30)
+    delay = RETRY_BACKOFF_INITIAL_SECONDS * (1 << exponent)
+    return min(delay, RETRY_BACKOFF_MAX_SECONDS)
 
 
 def post_multipart(
@@ -760,20 +872,20 @@ def post_multipart(
 
     field_parts = [multipart_field(boundary, key, value) for key, value in fields.items()]
     file_header = multipart_file_header(boundary, file_field, file_path.name, content_type)
-    file_size = get_upload_file_size(file_path)
-    validate_upload_file_size(file_path, file_size)
     closing = f"\r\n--{boundary}--\r\n".encode()
-    content_length = (
-        sum(len(part) for part in field_parts) + len(file_header) + file_size + len(closing)
-    )
 
     connection = http.client.HTTPConnection(host, port, timeout=UPLOAD_TIMEOUT_SECONDS)
+    upload_file: BinaryIO | None = None
     request_body_sent = False
     response: http.client.HTTPResponse | None = None
     body: bytes | None = None
     try:
+        upload_file, file_size = open_upload_file(file_path)
+        content_length = (
+            sum(len(part) for part in field_parts) + len(file_header) + file_size + len(closing)
+        )
+
         connection.putrequest("POST", f"/bot{token}/{method}")
-        connection.putheader("Host", f"{host}:{port}")
         connection.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
         connection.putheader("Content-Length", str(content_length))
         connection.endheaders()
@@ -781,7 +893,7 @@ def post_multipart(
         for part in field_parts:
             connection.send(part)
         connection.send(file_header)
-        send_file_with_progress(connection, file_path, file_size)
+        send_file_with_progress(connection, upload_file, file_path, file_size)
         connection.send(closing)
         request_body_sent = True
 
@@ -800,7 +912,15 @@ def post_multipart(
             retry_after_header=retry_after_header,
         ) from exc
     finally:
-        connection.close()
+        if upload_file is not None:
+            try:
+                upload_file.close()
+            except OSError:
+                pass
+        try:
+            connection.close()
+        except OSError:
+            pass
 
     assert response is not None
     assert body is not None
@@ -810,21 +930,23 @@ def post_multipart(
     except UnicodeDecodeError as exc:
         raise response_protocol_error(
             response.status,
-            f"Bot API returned a non-UTF-8 response with HTTP {response.status}",
+            f"Bot API returned a non-UTF-8 response with HTTP {response.status}; "
+            f"response length={len(body)} bytes",
             retry_after_header=response.getheader("Retry-After"),
         ) from exc
     except json.JSONDecodeError as exc:
-        snippet = body[:500].decode("utf-8", errors="replace")
         raise response_protocol_error(
             response.status,
-            f"Bot API returned invalid JSON with HTTP {response.status}: {snippet}",
+            f"Bot API returned invalid JSON with HTTP {response.status}; "
+            f"response length={len(body)} bytes",
             retry_after_header=response.getheader("Retry-After"),
         ) from exc
 
     if not isinstance(payload, dict):
         raise response_protocol_error(
             response.status,
-            f"Bot API returned a non-object JSON response with HTTP {response.status}",
+            f"Bot API returned a non-object JSON response with HTTP {response.status}; "
+            f"response length={len(body)} bytes",
             retry_after_header=response.getheader("Retry-After"),
         )
 
@@ -860,7 +982,6 @@ def post_json(
     body: bytes | None = None
     try:
         connection.putrequest("POST", f"/bot{token}/{method}")
-        connection.putheader("Host", f"{host}:{port}")
         connection.putheader("Content-Type", "application/json; charset=utf-8")
         connection.putheader("Content-Length", str(len(body_to_send)))
         connection.endheaders()
@@ -892,21 +1013,23 @@ def post_json(
     except UnicodeDecodeError as exc:
         raise response_protocol_error(
             response.status,
-            f"Bot API returned a non-UTF-8 response with HTTP {response.status}",
+            f"Bot API returned a non-UTF-8 response with HTTP {response.status}; "
+            f"response length={len(body)} bytes",
             retry_after_header=response.getheader("Retry-After"),
         ) from exc
     except json.JSONDecodeError as exc:
-        snippet = body[:500].decode("utf-8", errors="replace")
         raise response_protocol_error(
             response.status,
-            f"Bot API returned invalid JSON with HTTP {response.status}: {snippet}",
+            f"Bot API returned invalid JSON with HTTP {response.status}; "
+            f"response length={len(body)} bytes",
             retry_after_header=response.getheader("Retry-After"),
         ) from exc
 
     if not isinstance(decoded, dict):
         raise response_protocol_error(
             response.status,
-            f"Bot API returned a non-object JSON response with HTTP {response.status}",
+            f"Bot API returned a non-object JSON response with HTTP {response.status}; "
+            f"response length={len(body)} bytes",
             retry_after_header=response.getheader("Retry-After"),
         )
 
@@ -921,18 +1044,45 @@ def post_json(
     return decoded
 
 
+def sanitize_untrusted_error_text(text: str) -> str:
+    redacted = BOT_TOKEN_PATH_PATTERN.sub("/bot<redacted>", text)
+    escaped = "".join(
+        character if character.isprintable() else ascii(character)[1:-1] for character in redacted
+    )
+    if len(escaped) <= MAX_UNTRUSTED_ERROR_TEXT_LENGTH:
+        return escaped
+
+    suffix = "...<truncated>"
+    return escaped[: MAX_UNTRUSTED_ERROR_TEXT_LENGTH - len(suffix)] + suffix
+
+
 def response_protocol_error(
     http_status: int,
     message: str,
     *,
     retry_after_header: str | None = None,
 ) -> AppError:
+    message = sanitize_untrusted_error_text(message)
     if is_retryable_status(http_status):
-        return RetryableUploadError(
+        return uncertain_upload_error(
             message,
             retry_after_seconds=parse_retry_after(retry_after_header),
         )
+    if 200 <= http_status < 300:
+        return uncertain_upload_error(message)
     return NonRetryableUploadError(f"{message}; not retrying")
+
+
+def uncertain_upload_error(
+    message: str,
+    *,
+    retry_after_seconds: int | None = None,
+) -> RetryableUploadError:
+    return RetryableUploadError(
+        f"{message}; the request may already have succeeded",
+        retry_after_seconds=retry_after_seconds,
+        outcome_uncertain=True,
+    )
 
 
 def make_transport_error(
@@ -944,44 +1094,43 @@ def make_transport_error(
     http_status: int | None,
     retry_after_header: str | None,
 ) -> AppError:
+    error_text = sanitize_untrusted_error_text(str(error))
     if http_status is not None:
-        message = f"Bot API response failed with HTTP {http_status}: {error}"
+        message = f"Bot API response failed with HTTP {http_status}: {error_text}"
         if is_retryable_status(http_status):
-            return RetryableUploadError(
+            return uncertain_upload_error(
                 message,
                 retry_after_seconds=parse_retry_after(retry_after_header),
             )
         if 200 <= http_status < 300:
-            return NonRetryableUploadError(
-                f"{message}; upload outcome is unknown; not retrying to avoid a duplicate message"
-            )
+            return uncertain_upload_error(f"{message}; upload outcome is uncertain")
         return NonRetryableUploadError(f"{message}; request rejected; not retrying")
 
     if request_body_sent:
-        return NonRetryableUploadError(
+        return uncertain_upload_error(
             f"upload request body was fully sent to {host}:{port}, but no response was received: "
-            f"{error}; upload outcome is unknown; not retrying to avoid a duplicate message"
+            f"{error_text}; upload outcome is uncertain"
         )
 
     if isinstance(error, ConnectionRefusedError):
-        return NonRetryableUploadError(
+        return RetryableUploadError(
             f"local Bot API server is not running at {host}:{port}. "
-            "Start it first in another terminal with: just server; not retrying"
+            "Start it first in another terminal with: just server"
         )
 
     if isinstance(error, socket.gaierror):
         return NonRetryableUploadError(
-            f"failed to resolve local Bot API server host {host!r}: {error}; not retrying"
+            f"failed to resolve local Bot API server host {host!r}: {error_text}; not retrying"
         )
 
     if is_transient_transport_error(error):
         return RetryableUploadError(
-            f"transient error while sending to local Bot API server at {host}:{port}: {error}"
+            f"transient error while sending to local Bot API server at {host}:{port}: {error_text}"
         )
 
     return NonRetryableUploadError(
         f"non-transient error while calling local Bot API server at {host}:{port}: "
-        f"{error}; not retrying"
+        f"{error_text}; not retrying"
     )
 
 
@@ -1020,7 +1169,10 @@ def make_bot_api_error(
     retry_after_header: str | None = None,
 ) -> AppError:
     description_raw = payload.get("description", "unknown Bot API error")
-    description = description_raw if isinstance(description_raw, str) else repr(description_raw)
+    description_text = (
+        description_raw if isinstance(description_raw, str) else repr(description_raw)
+    )
+    description = sanitize_untrusted_error_text(description_text)
     error_code_raw = payload.get("error_code")
     error_code = (
         error_code_raw
@@ -1053,7 +1205,14 @@ def make_bot_api_error(
     if parameter_details:
         message = f"{message} ({', '.join(parameter_details)})"
 
-    if "FILE_PARTS_INVALID" in description.upper():
+    status = http_status if http_status is not None else error_code
+    if status is not None and is_retryable_status(status) and payload.get("ok") is not False:
+        return uncertain_upload_error(
+            message,
+            retry_after_seconds=retry_after,
+        )
+
+    if "FILE_PARTS_INVALID" in description_text.upper():
         try:
             file_size = file_path.stat().st_size
         except OSError:
@@ -1078,9 +1237,12 @@ def make_bot_api_error(
             "The same upload request will not succeed unchanged; not retrying"
         )
 
-    status = http_status if http_status is not None else error_code
     if status is not None and is_retryable_status(status):
         return RetryableUploadError(message, retry_after_seconds=retry_after)
+    if status is None:
+        return uncertain_upload_error(
+            f"{message}; Bot API returned an error without a valid status code"
+        )
 
     return NonRetryableUploadError(f"{message}; request rejected; not retrying")
 
@@ -1091,6 +1253,7 @@ def is_retryable_status(status: int) -> bool:
 
 def send_file_with_progress(
     connection: http.client.HTTPConnection,
+    upload_file: BinaryIO,
     file_path: Path,
     file_size: int,
 ) -> None:
@@ -1101,52 +1264,44 @@ def send_file_with_progress(
     progress_width = print_progress(sent, file_size, started_at, force=True)
 
     try:
-        try:
-            file = file_path.open("rb")
-        except OSError as exc:
-            raise NonRetryableUploadError(
-                f"failed to open upload file {file_path}: {exc}; not retrying"
-            ) from exc
-
-        with file:
-            while sent < file_size:
-                try:
-                    chunk = file.read(min(CHUNK_SIZE, file_size - sent))
-                except OSError as exc:
-                    raise NonRetryableUploadError(
-                        f"failed to read upload file {file_path}: {exc}; not retrying"
-                    ) from exc
-                if not chunk:
-                    raise NonRetryableUploadError(
-                        f"upload file changed size while reading: {file_path}; "
-                        f"expected {file_size:,} bytes, reached EOF after {sent:,} bytes; "
-                        "not retrying"
-                    )
-
-                connection.send(chunk)
-                sent += len(chunk)
-                now = time.monotonic()
-                if now - last_report_at >= PROGRESS_INTERVAL_SECONDS or sent >= file_size:
-                    progress_width = print_progress(
-                        sent,
-                        file_size,
-                        started_at,
-                        force=sent >= file_size,
-                        previous_width=progress_width,
-                    )
-                    last_report_at = now
-
+        while sent < file_size:
             try:
-                extra = file.read(1)
+                chunk = upload_file.read(min(CHUNK_SIZE, file_size - sent))
             except OSError as exc:
                 raise NonRetryableUploadError(
-                    f"failed to verify upload file size for {file_path}: {exc}; not retrying"
+                    f"failed to read upload file {file_path}: {exc}; not retrying"
                 ) from exc
-            if extra:
+            if not chunk:
                 raise NonRetryableUploadError(
-                    f"upload file grew beyond its initial size of {file_size:,} bytes "
-                    f"while reading: {file_path}; not retrying"
+                    f"upload file changed size while reading: {file_path}; "
+                    f"expected {file_size:,} bytes, reached EOF after {sent:,} bytes; "
+                    "not retrying"
                 )
+
+            connection.send(chunk)
+            sent += len(chunk)
+            now = time.monotonic()
+            if now - last_report_at >= PROGRESS_INTERVAL_SECONDS or sent >= file_size:
+                progress_width = print_progress(
+                    sent,
+                    file_size,
+                    started_at,
+                    force=sent >= file_size,
+                    previous_width=progress_width,
+                )
+                last_report_at = now
+
+        try:
+            extra = upload_file.read(1)
+        except OSError as exc:
+            raise NonRetryableUploadError(
+                f"failed to verify upload file size for {file_path}: {exc}; not retrying"
+            ) from exc
+        if extra:
+            raise NonRetryableUploadError(
+                f"upload file grew beyond its initial size of {file_size:,} bytes "
+                f"while reading: {file_path}; not retrying"
+            )
     finally:
         if progress_is_tty:
             print()
