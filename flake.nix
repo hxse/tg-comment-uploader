@@ -15,9 +15,6 @@
           uv
           python312
           ffmpeg
-          telegram-bot-api
-          curl
-          jq
         ];
       };
     };

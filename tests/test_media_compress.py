@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from tg_comment_uploader.ffmpeg_helpers import parse_ffmpeg_progress
 from tg_comment_uploader.media_compress import (
     CompressionError,
     CompressionPlan,
@@ -17,7 +18,6 @@ from tg_comment_uploader.media_compress import (
     build_ffmpeg_pass_command,
     build_ffprobe_command,
     compress_video,
-    parse_ffmpeg_progress,
     parse_probe_json,
     plan_compression,
     probe_media,

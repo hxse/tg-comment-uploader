@@ -9,8 +9,8 @@ import pytest
 
 from tg_comment_uploader.terminal_progress import (
     BAR_WIDTH,
-    RESPONSE_WAIT_MESSAGE,
-    ResponseWaitIndicator,
+    TELEGRAM_CONFIRMATION_WAIT_MESSAGE,
+    TelegramConfirmationWaitIndicator,
     TerminalProgress,
 )
 
@@ -127,10 +127,10 @@ def test_log_is_an_ordinary_line_in_non_tty_mode() -> None:
     progress = TerminalProgress(stream=stream, clock=FakeClock())
 
     progress.update("upload", 0.0)
-    progress.log("waiting for server")
+    progress.log("waiting for Telegram")
 
     output = stream.getvalue()
-    assert output.splitlines()[-1] == "waiting for server"
+    assert output.splitlines()[-1] == "waiting for Telegram"
     assert "\r" not in output
 
 
@@ -243,12 +243,12 @@ def wait_until(predicate: Callable[[], bool], *, timeout: float = 1.0) -> None:
         if predicate():
             return
         time.sleep(0.002)
-    pytest.fail("timed out waiting for response indicator update")
+    pytest.fail("timed out waiting for Telegram confirmation indicator update")
 
 
-def test_response_wait_tty_spins_on_one_line_and_finishes_with_newline() -> None:
+def test_telegram_confirmation_wait_tty_spins_on_one_line_and_finishes_with_newline() -> None:
     stream = FakeStream(is_tty=True)
-    indicator = ResponseWaitIndicator(
+    indicator = TelegramConfirmationWaitIndicator(
         stream=stream,
         clock=StepClock(step=1.0),
         interval_seconds=0.01,
@@ -261,7 +261,7 @@ def test_response_wait_tty_spins_on_one_line_and_finishes_with_newline() -> None
 
     output = stream.getvalue()
     assert indicator.running is False
-    assert RESPONSE_WAIT_MESSAGE in output
+    assert TELEGRAM_CONFIRMATION_WAIT_MESSAGE in output
     assert "(elapsed 0:00)" in output
     assert "(elapsed 0:01)" in output
     assert output.count("\r") >= 2
@@ -271,9 +271,11 @@ def test_response_wait_tty_spins_on_one_line_and_finishes_with_newline() -> None
     assert " eta " not in output
 
 
-def test_response_wait_non_tty_logs_immediately_and_heartbeats_without_carriage() -> None:
+def test_telegram_confirmation_wait_non_tty_logs_immediately_and_heartbeats_without_carriage() -> (
+    None
+):
     stream = FakeStream(is_tty=False)
-    indicator = ResponseWaitIndicator(
+    indicator = TelegramConfirmationWaitIndicator(
         stream=stream,
         clock=StepClock(step=30.0),
         interval_seconds=0.01,
@@ -284,15 +286,15 @@ def test_response_wait_non_tty_logs_immediately_and_heartbeats_without_carriage(
     indicator.stop()
 
     lines = stream.getvalue().splitlines()
-    assert lines[0] == f"{RESPONSE_WAIT_MESSAGE} (elapsed 0:00)"
-    assert lines[1] == f"{RESPONSE_WAIT_MESSAGE} (elapsed 0:30)"
+    assert lines[0] == f"{TELEGRAM_CONFIRMATION_WAIT_MESSAGE} (elapsed 0:00)"
+    assert lines[1] == f"{TELEGRAM_CONFIRMATION_WAIT_MESSAGE} (elapsed 0:30)"
     assert "\r" not in stream.getvalue()
     assert all("%" not in line and " eta " not in line for line in lines)
 
 
-def test_response_wait_context_stops_thread_on_keyboard_interrupt() -> None:
+def test_telegram_confirmation_wait_context_stops_thread_on_keyboard_interrupt() -> None:
     stream = FakeStream(is_tty=True)
-    indicator = ResponseWaitIndicator(stream=stream, interval_seconds=60.0)
+    indicator = TelegramConfirmationWaitIndicator(stream=stream, interval_seconds=60.0)
 
     with pytest.raises(KeyboardInterrupt):
         with indicator:
@@ -303,24 +305,24 @@ def test_response_wait_context_stops_thread_on_keyboard_interrupt() -> None:
     assert stream.getvalue().endswith("\n")
 
 
-def test_response_wait_start_and_stop_are_idempotent() -> None:
+def test_telegram_confirmation_wait_start_and_stop_are_idempotent() -> None:
     stream = FakeStream(is_tty=True)
-    indicator = ResponseWaitIndicator(stream=stream, interval_seconds=60.0)
+    indicator = TelegramConfirmationWaitIndicator(stream=stream, interval_seconds=60.0)
 
     indicator.start()
     indicator.start()
     indicator.stop()
     indicator.stop()
 
-    assert stream.getvalue().count(RESPONSE_WAIT_MESSAGE) == 1
+    assert stream.getvalue().count(TELEGRAM_CONFIRMATION_WAIT_MESSAGE) == 1
     assert stream.getvalue().count("\n") == 1
     assert indicator.running is False
 
 
 @pytest.mark.parametrize("interval", [0.0, -1.0, math.inf, math.nan])
-def test_response_wait_rejects_invalid_interval(interval: float) -> None:
+def test_telegram_confirmation_wait_rejects_invalid_interval(interval: float) -> None:
     with pytest.raises(ValueError, match="finite and positive"):
-        ResponseWaitIndicator(
+        TelegramConfirmationWaitIndicator(
             stream=FakeStream(is_tty=False),
             interval_seconds=interval,
         )
@@ -331,8 +333,8 @@ class BrokenOutputStream(FakeStream):
         raise RuntimeError("output unavailable")
 
 
-def test_response_wait_output_failure_is_silently_disabled() -> None:
-    indicator = ResponseWaitIndicator(
+def test_telegram_confirmation_wait_output_failure_is_silently_disabled() -> None:
+    indicator = TelegramConfirmationWaitIndicator(
         stream=BrokenOutputStream(is_tty=True),
         interval_seconds=0.01,
     )
@@ -343,11 +345,11 @@ def test_response_wait_output_failure_is_silently_disabled() -> None:
     assert indicator.running is False
 
 
-def test_response_wait_clock_failure_is_silently_disabled() -> None:
+def test_telegram_confirmation_wait_clock_failure_is_silently_disabled() -> None:
     def broken_clock() -> float:
         raise RuntimeError("clock unavailable")
 
-    indicator = ResponseWaitIndicator(
+    indicator = TelegramConfirmationWaitIndicator(
         stream=FakeStream(is_tty=False),
         clock=broken_clock,
         interval_seconds=0.01,
@@ -359,12 +361,12 @@ def test_response_wait_clock_failure_is_silently_disabled() -> None:
     assert indicator.running is False
 
 
-def test_response_wait_base_exception_from_initial_output_propagates() -> None:
+def test_telegram_confirmation_wait_base_exception_from_initial_output_propagates() -> None:
     class InterruptedStream(FakeStream):
         def write(self, value: str) -> int:
             raise KeyboardInterrupt
 
-    indicator = ResponseWaitIndicator(
+    indicator = TelegramConfirmationWaitIndicator(
         stream=InterruptedStream(is_tty=True),
         interval_seconds=0.01,
     )
@@ -373,7 +375,7 @@ def test_response_wait_base_exception_from_initial_output_propagates() -> None:
         indicator.start()
 
 
-def test_response_wait_thread_start_failure_does_not_escape(
+def test_telegram_confirmation_wait_thread_start_failure_does_not_escape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class StartFailureThread:
@@ -391,7 +393,7 @@ def test_response_wait_thread_start_failure_does_not_escape(
 
     stream = FakeStream(is_tty=True)
     monkeypatch.setattr("tg_comment_uploader.terminal_progress.Thread", StartFailureThread)
-    indicator = ResponseWaitIndicator(stream=stream)
+    indicator = TelegramConfirmationWaitIndicator(stream=stream)
 
     indicator.start()
     indicator.stop()
@@ -400,7 +402,7 @@ def test_response_wait_thread_start_failure_does_not_escape(
     assert stream.getvalue().endswith("\n")
 
 
-def test_response_wait_join_failure_does_not_escape(
+def test_telegram_confirmation_wait_join_failure_does_not_escape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class JoinFailureThread:
@@ -418,7 +420,7 @@ def test_response_wait_join_failure_does_not_escape(
 
     stream = FakeStream(is_tty=True)
     monkeypatch.setattr("tg_comment_uploader.terminal_progress.Thread", JoinFailureThread)
-    indicator = ResponseWaitIndicator(stream=stream)
+    indicator = TelegramConfirmationWaitIndicator(stream=stream)
 
     indicator.start()
     assert indicator.running is True

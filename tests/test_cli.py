@@ -1,371 +1,644 @@
-import http.client
-import io
+from __future__ import annotations
+
+import argparse
+import hashlib
 import json
 import os
-import tomllib
-from contextlib import nullcontext
+from contextlib import contextmanager
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from tg_comment_uploader.cli import (
     DEFAULT_PROFILE,
     DEFAULT_RETRIES,
-    MAX_UNTRUSTED_ERROR_TEXT_LENGTH,
-    SAFE_UPLOAD_LIMIT_BYTES,
     AppConfig,
     AppError,
     BotConfig,
     NonRetryableUploadError,
     ProfileConfig,
     RetryableUploadError,
-    ServerConfig,
     build_parser,
+    fingerprint_file,
     format_bytes,
-    format_duration,
     load_config,
-    make_bot_api_error,
-    make_transport_error,
-    print_progress,
+    main,
     print_upload_plan,
     render_caption,
-    response_protocol_error,
+    retry_delay_seconds,
     retry_upload,
     run_upload_locked,
-    run_server,
-    run_upload,
-    sanitize_untrusted_error_text,
-    send_file_with_progress,
-    send_video,
-    upload_with_retries,
+    validate_caption_template_shape,
     validate_upload_paths,
 )
+from tg_comment_uploader.telegram_sender import SAFE_UPLOAD_LIMIT_BYTES, UploadItem
+from tg_comment_uploader.media_workflow import PreparedMedia
+from tg_comment_uploader.upload_state import (
+    MtprotoPaths,
+    PendingOwner,
+    PendingUploadStore,
+)
+from tg_comment_uploader.upload_contract import OversizePolicy
 
 
-def write_test_config(
-    tmp_path: Path,
-    profiles: dict[str, dict[str, Any]],
-) -> Path:
-    path = tmp_path / "config.json"
+def write_config(path: Path) -> None:
     path.write_text(
-        json.dumps(
-            {
-                "bot": {
-                    "token": "token",
-                    "api_id": 1,
-                    "api_hash": "hash",
-                },
-                "server": {
-                    "host": "127.0.0.1",
-                    "port": 48973,
-                    "binary": "telegram-bot-api",
-                    "work_dir": ".local/test",
-                },
-                "profiles": profiles,
-            }
-        ),
+        """
+{
+  "bot": {"token": "123456:TEST_TOKEN", "api_id": 123, "api_hash": "hash"},
+  "profiles": {
+    "default": {
+      "chat_id": "-1001234567890",
+      "reply_message_id": 42,
+      "caption": "{stem}",
+      "supports_streaming": false
+    },
+    "direct": {"chat_id": "@private_test", "caption": null},
+    "direct-null": {"chat_id": "-1002", "reply_message_id": null}
+  }
+"""
+        + "\n}\n",
         encoding="utf-8",
     )
-    return path
 
 
-def test_load_config_supports_reply_and_direct_profiles(tmp_path: Path) -> None:
-    config = load_config(
-        write_test_config(
-            tmp_path,
-            {
-                "default": {
-                    "chat_id": "-1001111111111",
-                    "reply_message_id": 12345,
-                },
-                "direct": {
-                    "chat_id": "-1002222222222",
-                },
-                "direct-null": {
-                    "chat_id": "-1003333333333",
-                    "reply_message_id": None,
-                },
-            },
-        )
+def fake_profile(reply_message_id: int | None = 42) -> ProfileConfig:
+    return ProfileConfig(
+        chat_id="-1001234567890",
+        reply_message_id=reply_message_id,
+        caption="{stem}",
+        supports_streaming=False,
     )
 
-    assert config.profiles["default"].reply_message_id == 12345
+
+def fake_config(profile: ProfileConfig | None = None) -> AppConfig:
+    selected = profile or fake_profile()
+    return AppConfig(
+        bot=BotConfig(token="123456:TEST", api_id=123, api_hash="hash"),
+        profiles={"default": selected},
+    )
+
+
+def test_load_config_accepts_only_the_final_schema(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    write_config(config_path)
+
+    config = load_config(config_path)
+
+    assert config.bot == BotConfig(token="123456:TEST_TOKEN", api_id=123, api_hash="hash")
+    assert config.profiles["default"].reply_message_id == 42
+    assert config.profiles["default"].supports_streaming is False
+    assert config.profiles["direct"].caption == ""
     assert config.profiles["direct"].reply_message_id is None
     assert config.profiles["direct-null"].reply_message_id is None
+    if os.name == "posix":
+        assert config_path.stat().st_mode & 0o777 == 0o600
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes are not portable")
-def test_load_config_secures_config_file_mode(tmp_path: Path) -> None:
-    path = write_test_config(
-        tmp_path,
-        {"default": {"chat_id": "-1001111111111"}},
-    )
-    path.chmod(0o644)
-
-    load_config(path)
-
-    assert path.stat().st_mode & 0o777 == 0o600
-
-
-@pytest.mark.parametrize(
-    "invalid_value",
-    [True, "12345", 1.5, {}],
-    ids=["boolean", "string", "float", "object"],
-)
-def test_load_config_rejects_invalid_optional_reply_message_id(
-    tmp_path: Path,
-    invalid_value: Any,
-) -> None:
-    path = write_test_config(
-        tmp_path,
-        {
-            "invalid": {
-                "chat_id": "-1001111111111",
-                "reply_message_id": invalid_value,
-            }
-        },
-    )
-
-    with pytest.raises(
-        AppError,
-        match=r"profiles\.invalid\.reply_message_id must be an integer or null",
+def test_load_config_rejects_unknown_fields_at_every_schema_layer(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    private_value = "PRIVATE_UNKNOWN_VALUE"
+    for payload, extra_key in (
+        (
+            {
+                "bot": {"token": "1:x", "api_id": 1, "api_hash": "h"},
+                "profiles": {"default": {"chat_id": "-1001"}},
+                "unknown_top_level": private_value,
+            },
+            "unknown_top_level",
+        ),
+        (
+            {
+                "bot": {
+                    "token": "1:x",
+                    "api_id": 1,
+                    "api_hash": "h",
+                    "unknown_bot_field": private_value,
+                },
+                "profiles": {"default": {"chat_id": "-1001"}},
+            },
+            "unknown_bot_field",
+        ),
+        (
+            {
+                "bot": {"token": "1:x", "api_id": 1, "api_hash": "h"},
+                "profiles": {
+                    "default": {
+                        "chat_id": "-1001",
+                        "unknown_profile_field": private_value,
+                    }
+                },
+            },
+            "unknown_profile_field",
+        ),
     ):
-        load_config(path)
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(
+            AppError,
+            match=rf"(?s){extra_key}.*Extra inputs are not permitted",
+        ) as caught:
+            load_config(config_path)
+        assert private_value not in str(caught.value)
 
 
-@pytest.mark.parametrize(
-    "reply_message_id",
-    [12345, None],
-    ids=["reply", "direct"],
-)
-def test_send_video_includes_reply_parameters_only_when_configured(
-    monkeypatch: pytest.MonkeyPatch,
-    reply_message_id: int | None,
-) -> None:
-    captured_fields: dict[str, str] = {}
+def test_config_models_are_strict_frozen_and_hide_inputs() -> None:
+    for model in (BotConfig, ProfileConfig, AppConfig):
+        assert model.model_config["strict"] is True
+        assert model.model_config["extra"] == "forbid"
+        assert model.model_config["frozen"] is True
+        assert model.model_config["hide_input_in_errors"] is True
 
-    def fake_post_multipart(**kwargs: Any) -> dict[str, Any]:
-        fields = kwargs["fields"]
-        assert isinstance(fields, dict)
-        captured_fields.update(fields)
-        return {"ok": True, "result": {"message_id": 42}}
+    bot = BotConfig(token="123456:TEST", api_id=123, api_hash="hash")
+    with pytest.raises(ValidationError, match="frozen"):
+        setattr(bot, "api_hash", "changed")
 
-    monkeypatch.setattr("tg_comment_uploader.cli.post_multipart", fake_post_multipart)
 
-    result = send_video(
-        fake_config(),
-        fake_profile(reply_message_id),
-        Path("/videos/a.mp4"),
-        "caption",
+def test_config_rejects_duplicate_json_fields_recursively(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        """
+{
+  "bot": {"token": "1:x", "api_id": 1, "api_hash": "h"},
+  "profiles": {
+    "default": {
+      "chat_id": "-1001",
+      "reply_message_id": 42,
+      "reply_message_id": null
+    }
+  }
+}
+""",
+        encoding="utf-8",
     )
 
-    assert result == {"message_id": 42}
-    assert captured_fields["chat_id"] == "-1001234567890"
-    assert captured_fields["supports_streaming"] == "true"
-    assert captured_fields["caption"] == "caption"
-    if reply_message_id is None:
-        assert "reply_parameters" not in captured_fields
-    else:
-        assert json.loads(captured_fields["reply_parameters"]) == {"message_id": reply_message_id}
+    with pytest.raises(AppError, match="duplicate JSON object key 'reply_message_id'"):
+        load_config(config_path)
+
+
+def test_config_enforces_telegram_signed_int32_bounds() -> None:
+    maximum = 2_147_483_647
+
+    assert BotConfig(token="1:x", api_id=maximum, api_hash="h").api_id == maximum
+    assert ProfileConfig(chat_id="-1001", reply_message_id=maximum).reply_message_id == maximum
+    with pytest.raises(ValidationError, match="less than or equal to 2147483647"):
+        BotConfig(token="1:x", api_id=maximum + 1, api_hash="h")
+    with pytest.raises(ValidationError, match="less than or equal to 2147483647"):
+        ProfileConfig(chat_id="-1001", reply_message_id=maximum + 1)
+
+
+def test_load_config_accepts_string_and_integer_chat_ids(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        """
+{
+  "bot": {"token": "1:x", "api_id": 1, "api_hash": "h"},
+  "profiles": {
+    "string": {"chat_id": "-1001"},
+    "integer": {"chat_id": -1002}
+  }
+}
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.profiles["string"].chat_id == "-1001"
+    assert config.profiles["integer"].chat_id == "-1002"
+
+
+def test_load_config_validation_does_not_echo_credentials(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    token_value = 987_654_321_987
+    api_hash_value = "PRIVATE_API_HASH_VALUE"
+    config_path.write_text(
+        """
+{
+  "bot": {
+    "token": 987654321987,
+    "api_id": 1,
+    "api_hash": ["PRIVATE_API_HASH_VALUE"]
+  },
+  "profiles": {"default": {"chat_id": "-1001"}}
+}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AppError) as caught:
+        load_config(config_path)
+
+    message = str(caught.value)
+    assert str(token_value) not in message
+    assert api_hash_value not in message
+    assert "bot.token" in message
+    assert "bot.api_hash" in message
+
+
+def test_load_config_rejects_malformed_token_without_echoing_it(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    malformed_token = "PRIVATE_MALFORMED_TOKEN_VALUE"
+    config_path.write_text(
+        """
+{
+  "bot": {
+    "token": "PRIVATE_MALFORMED_TOKEN_VALUE",
+    "api_id": 1,
+    "api_hash": "h"
+  },
+  "profiles": {"default": {"chat_id": "-1001"}}
+}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AppError) as caught:
+        load_config(config_path)
+
+    message = str(caught.value)
+    assert malformed_token not in message
+    assert "bot.token" in message
+    assert "valid bot ID prefix" in message
+
+
+@pytest.mark.parametrize("invalid", [True, "42", 1.5, [], 0, -1])
+def test_load_config_rejects_non_positive_integer_reply_id(
+    tmp_path: Path,
+    invalid: object,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        """
+{
+  "bot": {"token": "1:x", "api_id": 1, "api_hash": "h"},
+  "profiles": {"invalid": {"chat_id": "-1001", "reply_message_id": %s}}
+}
+"""
+        % json.dumps(invalid),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AppError, match=r"reply_message_id"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize("invalid", [True, "1", 0, -1])
+def test_load_config_rejects_non_positive_integer_api_id(
+    tmp_path: Path,
+    invalid: object,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        """
+{
+  "bot": {"token": "1:x", "api_id": %s, "api_hash": "h"},
+  "profiles": {"default": {"chat_id": "-1001"}}
+}
+"""
+        % __import__("json").dumps(invalid),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AppError, match=r"api_id"):
+        load_config(config_path)
 
 
 @pytest.mark.parametrize(
-    "invalid_result",
+    "invalid",
     [
-        None,
-        {},
-        {"message_id": True},
-        {"message_id": "42"},
+        " ",
+        " -1001",
+        "-1001 ",
+        "0",
+        "-0",
+        "Display Name",
+        "https://example.com/not-telegram",
+        "+8613800000000",
     ],
-    ids=["missing-result", "missing-message-id", "boolean-message-id", "string-message-id"],
 )
-def test_send_video_requires_a_valid_integer_message_id(
-    monkeypatch: pytest.MonkeyPatch,
-    invalid_result: Any,
+def test_load_config_rejects_locally_invalid_chat_id(
+    tmp_path: Path,
+    invalid: str,
 ) -> None:
-    monkeypatch.setattr(
-        "tg_comment_uploader.cli.post_multipart",
-        lambda **kwargs: {"ok": True, "result": invalid_result},
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        """
+{
+  "bot": {"token": "1:x", "api_id": 1, "api_hash": "h"},
+  "profiles": {"default": {"chat_id": %s}}
+}
+"""
+        % __import__("json").dumps(invalid),
+        encoding="utf-8",
     )
 
-    with pytest.raises(RetryableUploadError, match="valid message ID") as exc_info:
-        send_video(
-            fake_config(),
-            fake_profile(),
-            Path("/videos/a.mp4"),
-            "caption",
-        )
-
-    assert exc_info.value.outcome_uncertain is True
+    with pytest.raises(AppError, match=r"chat_id is invalid"):
+        load_config(config_path)
 
 
-def test_print_upload_plan_shows_reply_and_direct_modes(
+def test_parser_keeps_current_upload_and_pending_command_contract() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["upload", "-o", "split", "/videos/a.mp4"])
+
+    assert args.profile == DEFAULT_PROFILE
+    assert args.retries == DEFAULT_RETRIES == 5
+    assert args.oversize_policy == "split"
+    assert args.paths == ["/videos/a.mp4"]
+    assert parser.parse_args(["pending-status"]).config == Path("config/config.json")
+    discard = parser.parse_args(["pending-discard", "--operation-id", "abc"])
+    assert discard.operation_id == "abc"
+    assert discard.force_foreign_owner is False
+    forced = parser.parse_args(
+        ["pending-discard", "--operation-id", "abc", "--force-foreign-owner"]
+    )
+    assert forced.force_foreign_owner is True
+
+
+def test_main_has_stable_success_expected_failure_and_interrupt_codes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StaticParser:
+        def __init__(self, func: Any) -> None:
+            self.func = func
+
+        def parse_args(self, argv: list[str] | None) -> argparse.Namespace:
+            return argparse.Namespace(func=self.func)
+
+    monkeypatch.setattr(
+        "tg_comment_uploader.cli.build_parser", lambda: StaticParser(lambda args: 0)
+    )
+    assert main(["anything"]) == 0
+
+    def expected_failure(args: argparse.Namespace) -> int:
+        raise AppError("bad")
+
+    monkeypatch.setattr(
+        "tg_comment_uploader.cli.build_parser",
+        lambda: StaticParser(expected_failure),
+    )
+    assert main(["anything"]) == 1
+
+    def interrupted(args: argparse.Namespace) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "tg_comment_uploader.cli.build_parser",
+        lambda: StaticParser(interrupted),
+    )
+    assert main(["anything"]) == 130
+
+
+def test_print_upload_plan_distinguishes_reply_and_direct(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    print_upload_plan(
-        "default",
-        fake_profile(12345),
-        [Path("/videos/a.mp4")],
-    )
+    files = [Path("/videos/a.mp4")]
+    print_upload_plan("default", fake_profile(42), files, oversize_policy="split")
     reply_output = capsys.readouterr().out
-
-    print_upload_plan(
-        "direct",
-        fake_profile(None),
-        [Path("/videos/a.mp4")],
-    )
+    print_upload_plan("direct", fake_profile(None), files)
     direct_output = capsys.readouterr().out
 
     assert "delivery: reply" in reply_output
-    assert "reply_message_id: 12345" in reply_output
+    assert "reply_message_id: 42" in reply_output
+    assert "oversize_policy: split" in reply_output
     assert "delivery: direct" in direct_output
     assert "reply_message_id: <none>" in direct_output
 
 
-def test_render_caption_allows_exact_fields_and_escaped_braces() -> None:
-    path = Path("/videos/20260709 sample.mp4")
-
-    assert render_caption("{stem}", path) == "20260709 sample"
-    assert render_caption("{name}", path) == "20260709 sample.mp4"
-    assert render_caption("{{video}} {parent}/{name}", path) == (
-        "{video} videos/20260709 sample.mp4"
-    )
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        ("{name}", "video.test.mp4"),
+        ("{stem}", "video.test"),
+        ("{suffix}", ".mp4"),
+        ("{parent}", "folder"),
+        ("{path}", "/root/folder/video.test.mp4"),
+        ("{{{stem}}}", "{video.test}"),
+        ("_*[]<>& {stem}", "_*[]<>& video.test"),
+    ],
+)
+def test_caption_rendering_remains_exact_plain_text(template: str, expected: str) -> None:
+    assert render_caption(template, Path("/root/folder/video.test.mp4")) == expected
 
 
 @pytest.mark.parametrize(
     "template",
-    [
-        "{missing}",
-        "{name[99]}",
-        "{name:}",
-        "{name.foo}",
-        "{name:d}",
-        "{name!r}",
-        "{}",
-        "{name",
-    ],
-    ids=[
-        "unknown",
-        "index",
-        "empty-format-spec",
-        "attribute",
-        "format-spec",
-        "conversion",
-        "automatic-field",
-        "malformed",
-    ],
+    ["{name[0]}", "{name.foo}", "{name!r}", "{name:>10}", "{}", "{unknown}", "{"],
 )
-def test_render_caption_rejects_non_exact_or_malformed_templates(template: str) -> None:
-    with pytest.raises(AppError, match="caption template"):
-        render_caption(template, Path("/videos/a.mp4"))
+def test_caption_template_rejects_non_exact_fields(template: str) -> None:
+    with pytest.raises(AppError):
+        validate_caption_template_shape(template, context="caption")
 
 
-def test_upload_parser_defaults_to_default_profile_and_five_retries() -> None:
-    args = build_parser().parse_args(["upload", "/videos/a.mp4"])
+def test_upload_path_validation_preserves_order_and_exact_size_limit(tmp_path: Path) -> None:
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
 
-    assert DEFAULT_PROFILE == "default"
-    assert DEFAULT_RETRIES == 5
-    assert args.profile == "default"
-    assert args.retries == 5
-    assert args.oversize_policy == "error"
-
-
-def test_upload_parser_accepts_short_oversize_policy_alias() -> None:
-    args = build_parser().parse_args(["upload", "-o", "split", "/videos/a.mp4"])
-
-    assert args.oversize_policy == "split"
-
-
-def test_just_upload_defaults_to_five_retries() -> None:
-    justfile = Path(__file__).parents[1] / "justfile"
-
-    content = justfile.read_text(encoding="utf-8")
-    assert 'profile := "default"' in content
-    assert 'retries := "5"' in content
-
-
-def test_check_uses_locked_non_mutating_dev_tools() -> None:
-    project_root = Path(__file__).parents[1]
-    justfile = (project_root / "justfile").read_text(encoding="utf-8")
-    pyproject = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
-
-    assert "uv run ruff format --check" in justfile
-    assert "uv run ty check" in justfile
-    assert "uvx ruff" not in justfile
-    assert "uvx ty" not in justfile
-    assert "ruff==0.15.21" in pyproject["dependency-groups"]["dev"]
-    assert "ty==0.0.58" in pyproject["dependency-groups"]["dev"]
-
-
-def test_validate_upload_paths_requires_absolute_path() -> None:
-    with pytest.raises(AppError, match="must be absolute"):
+    assert validate_upload_paths([str(second), str(first)]) == [second, first]
+    with pytest.raises(AppError, match="absolute"):
         validate_upload_paths(["relative.mp4"])
 
-
-def test_validate_upload_paths_preserves_order(tmp_path: Path) -> None:
-    first = tmp_path / "a.mp4"
-    second = tmp_path / "b.mp4"
-    first.write_bytes(b"a")
-    second.write_bytes(b"b")
-
-    assert validate_upload_paths([str(first), str(second)]) == [first, second]
-
-
-def test_validate_upload_paths_enforces_exact_size_limit(tmp_path: Path) -> None:
-    empty = tmp_path / "empty.mp4"
-    at_limit = tmp_path / "at-limit.mp4"
     oversized = tmp_path / "oversized.mp4"
-
-    empty.touch()
-    with at_limit.open("wb") as file:
-        file.truncate(SAFE_UPLOAD_LIMIT_BYTES)
-    with oversized.open("wb") as file:
-        file.truncate(SAFE_UPLOAD_LIMIT_BYTES + 1)
-
-    with pytest.raises(NonRetryableUploadError, match="upload file is empty"):
-        validate_upload_paths([str(empty)])
-
-    assert validate_upload_paths([str(at_limit)]) == [at_limit]
-
-    with pytest.raises(NonRetryableUploadError) as exc_info:
+    with oversized.open("wb") as output:
+        output.truncate(SAFE_UPLOAD_LIMIT_BYTES + 1)
+    with pytest.raises(NonRetryableUploadError, match="safe Telegram limit"):
         validate_upload_paths([str(oversized)])
-    message = str(exc_info.value)
-    assert str(oversized) in message
-    assert f"{SAFE_UPLOAD_LIMIT_BYTES + 1:,} bytes" in message
-    assert "limit=1.9 GiB (2,000,000,000 bytes)" in message
-    assert "--oversize-policy split" in message
-    assert "--oversize-policy compress" in message
-    assert "No upload was attempted" in message
+    assert validate_upload_paths([str(oversized)], allow_oversized=True) == [oversized]
 
 
-def test_run_upload_locked_rejects_non_local_server_before_file_validation(
+def test_fingerprint_file_hashes_one_stable_fd_and_reports_progress(tmp_path: Path) -> None:
+    path = tmp_path / "video.mp4"
+    content = b"abcdef" * 100
+    path.write_bytes(content)
+    reports: list[tuple[int, int]] = []
+
+    size, digest = fingerprint_file(
+        path, progress=lambda sent, total: reports.append((sent, total))
+    )
+
+    assert size == len(content)
+    assert digest == hashlib.sha256(content).hexdigest()
+    assert reports[0] == (0, len(content))
+    assert reports[-1] == (len(content), len(content))
+
+
+def test_retry_reuses_action_obeys_wait_and_stops_on_nonretryable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = AppConfig(
-        bot=BotConfig(token="token", api_id=1, api_hash="hash"),
-        server=ServerConfig(
-            host="example.com",
-            port=48973,
-            binary="telegram-bot-api",
-            work_dir=Path("."),
-        ),
-        profiles={"default": fake_profile()},
+    calls = 0
+    sleeps: list[int] = []
+
+    def flaky() -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RetryableUploadError("wait", retry_after_seconds=3)
+        return 42
+
+    monkeypatch.setattr("tg_comment_uploader.cli.time.sleep", sleeps.append)
+    assert retry_upload(flaky, label="video", retries=1) == 42
+    assert calls == 2
+    assert sleeps == [3]
+
+    def rejected() -> int:
+        raise NonRetryableUploadError("rejected")
+
+    with pytest.raises(NonRetryableUploadError):
+        retry_upload(rejected, label="video", retries=5)
+
+
+def test_retry_exhaustion_and_backoff_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[int] = []
+    monkeypatch.setattr("tg_comment_uploader.cli.time.sleep", sleeps.append)
+
+    with pytest.raises(AppError, match="failed after 6 attempts"):
+        retry_upload(
+            lambda: (_ for _ in ()).throw(RetryableUploadError("temporary")),
+            label="video",
+            retries=5,
+        )
+
+    assert sleeps == [1, 2, 4, 8, 16]
+    assert retry_delay_seconds(RetryableUploadError("x"), failed_attempt=99) == 30
+    assert (
+        retry_delay_seconds(
+            RetryableUploadError("x", retry_after_seconds=999_999),
+            failed_attempt=1,
+        )
+        == 86_400
     )
-    args = build_parser().parse_args(["upload", "/not/inspected.mp4"])
-
-    monkeypatch.setattr("tg_comment_uploader.cli.load_config", lambda path: config)
-
-    def fail_validation(*args: Any, **kwargs: Any) -> list[Path]:
-        raise AssertionError("upload paths must not be inspected for a remote server")
-
-    monkeypatch.setattr("tg_comment_uploader.cli.validate_upload_paths", fail_validation)
-
-    with pytest.raises(AppError, match="non-local Bot API server"):
-        run_upload_locked(args)
 
 
-def test_run_upload_locked_prerenders_all_captions_before_preparing_media(
+def test_uncertain_retry_explains_persisted_id_without_duplicate_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls = 0
+
+    def flaky() -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RetryableUploadError("lost", outcome_uncertain=True)
+        return 1
+
+    monkeypatch.setattr("tg_comment_uploader.cli.time.sleep", lambda seconds: None)
+    assert retry_upload(flaky, label="video", retries=1) == 1
+    error = capsys.readouterr().err
+    assert "same persisted Telegram random ID(s)" in error
+    assert "may create duplicate" not in error
+
+
+def test_uncertain_exhaustion_keeps_recovery_hint_with_zero_retries() -> None:
+    with pytest.raises(
+        AppError,
+        match=r"remains unconfirmed.*same persisted Telegram random ID\(s\)",
+    ):
+        retry_upload(
+            lambda: (_ for _ in ()).throw(
+                RetryableUploadError("response lost", outcome_uncertain=True)
+            ),
+            label="video",
+            retries=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(0, "0 B"), (1024, "1.0 KiB"), (1024**3, "1.0 GiB")],
+)
+def test_format_bytes(value: int, expected: str) -> None:
+    assert format_bytes(value) == expected
+
+
+class FakeSender:
+    def __init__(self, *, fail_once: bool = False) -> None:
+        self.fail_once = fail_once
+        self.calls: list[tuple[UploadItem, int, str]] = []
+        self.closed = 0
+
+    def send_video(
+        self,
+        item: UploadItem,
+        *,
+        random_id: int,
+        progress_callback: Any = None,
+        before_final_request: Any = None,
+    ) -> int:
+        self.calls.append((item, random_id, "video"))
+        if self.fail_once and len(self.calls) == 1:
+            raise RetryableUploadError("temporary")
+        if progress_callback is not None:
+            progress_callback(item.expected_size or 1, item.expected_size or 1)
+        if before_final_request is not None:
+            before_final_request()
+        return 700 + len(self.calls)
+
+    def send_media_group(self, *args: Any, **kwargs: Any) -> tuple[int, ...]:
+        raise AssertionError("media group was not expected")
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def install_runtime_fakes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sender: FakeSender,
+) -> tuple[PendingUploadStore, list[dict[str, Any]]]:
+    owner = PendingOwner(config_fingerprint="c" * 64, bot_id=123456)
+    state = PendingUploadStore(tmp_path / "pending.json", owner=owner)
+    paths = MtprotoPaths(
+        pending_path=state.path,
+        session_path=tmp_path / "sessions/test.session",
+        owner=owner,
+    )
+    constructions: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        "tg_comment_uploader.cli.create_pending_store",
+        lambda config_path, bot: (paths, state),
+    )
+
+    def fake_create_sender(*args: Any, **kwargs: Any) -> FakeSender:
+        constructions.append(kwargs)
+        kwargs["peer_resolved"](-1001234567890)
+        return sender
+
+    monkeypatch.setattr("tg_comment_uploader.cli.create_sender", fake_create_sender)
+    return state, constructions
+
+
+def test_full_single_video_orchestration_persists_before_send_and_closes_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    video = tmp_path / "source video.mp4"
+    video.write_bytes(b"video-content")
+    sender = FakeSender(fail_once=True)
+    state, constructions = install_runtime_fakes(tmp_path, monkeypatch, sender)
+    monkeypatch.setattr("tg_comment_uploader.cli.load_config", lambda path: fake_config())
+    monkeypatch.setattr("tg_comment_uploader.cli.time.sleep", lambda seconds: None)
+    args = build_parser().parse_args(["upload", "--retries", "1", str(video)])
+
+    assert run_upload_locked(args) == 0
+
+    assert len(constructions) == 1
+    assert constructions[0]["peer_resolved"]
+    assert len(sender.calls) == 2
+    assert sender.calls[0][1] == sender.calls[1][1]
+    assert sender.calls[0][0].caption == "source video"
+    assert sender.calls[0][0].expected_size == len(b"video-content")
+    assert sender.calls[0][0].expected_sha256 == hashlib.sha256(b"video-content").hexdigest()
+    assert sender.closed == 1
+    assert state.inspect() is None
+
+
+def test_resume_skips_media_preparation_for_a_durably_completed_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -373,715 +646,283 @@ def test_run_upload_locked_prerenders_all_captions_before_preparing_media(
     second = tmp_path / "second.mp4"
     first.write_bytes(b"first")
     second.write_bytes(b"second")
-    args = build_parser().parse_args(["upload", str(first), str(second)])
-    rendered: list[Path] = []
-    prepare_calls = 0
+    owner = PendingOwner(config_fingerprint="c" * 64, bot_id=123456)
+    state = PendingUploadStore(tmp_path / "pending.json", owner=owner)
+    paths = MtprotoPaths(
+        pending_path=state.path,
+        session_path=tmp_path / "sessions/test.session",
+        owner=owner,
+    )
+    prepared_paths: list[Path] = []
 
-    def fake_render(template: str, path: Path) -> str:
-        rendered.append(path)
-        if path == second:
-            raise AppError("invalid caption for second file")
-        return path.stem
+    class SequenceSender(FakeSender):
+        def __init__(self, *, fail_call: int | None = None, base: int = 100) -> None:
+            super().__init__()
+            self.fail_call = fail_call
+            self.base = base
 
-    def fail_prepare(*args: Any, **kwargs: Any) -> Any:
-        nonlocal prepare_calls
-        prepare_calls += 1
-        raise AssertionError("media preparation must not start before all captions render")
+        def send_video(self, item: UploadItem, **kwargs: Any) -> int:
+            random_id = kwargs["random_id"]
+            self.calls.append((item, random_id, "video"))
+            kwargs["before_final_request"]()
+            if self.fail_call == len(self.calls):
+                raise RetryableUploadError(
+                    "response lost",
+                    outcome_uncertain=True,
+                    final_request_started=True,
+                )
+            return self.base + len(self.calls)
+
+    first_sender = SequenceSender(fail_call=2)
+    second_sender = SequenceSender(base=200)
+    senders = [first_sender, second_sender]
+
+    @contextmanager
+    def fake_prepare(
+        path: Path,
+        policy: OversizePolicy,
+        **kwargs: Any,
+    ) -> Iterator[PreparedMedia]:
+        prepared_paths.append(path)
+        yield PreparedMedia(source=path, paths=(path,), policy=policy)
 
     monkeypatch.setattr("tg_comment_uploader.cli.load_config", lambda path: fake_config())
-    monkeypatch.setattr("tg_comment_uploader.cli.render_caption", fake_render)
-    monkeypatch.setattr("tg_comment_uploader.cli.prepare_media", fail_prepare)
+    monkeypatch.setattr(
+        "tg_comment_uploader.cli.create_pending_store",
+        lambda config_path, bot: (paths, state),
+    )
+    monkeypatch.setattr("tg_comment_uploader.cli.prepare_media", fake_prepare)
 
-    with pytest.raises(AppError, match="invalid caption for second file"):
+    def fake_create_sender(*args: Any, **kwargs: Any) -> SequenceSender:
+        kwargs["peer_resolved"](-1001234567890)
+        return senders.pop(0)
+
+    monkeypatch.setattr("tg_comment_uploader.cli.create_sender", fake_create_sender)
+    args = build_parser().parse_args(["upload", "--retries", "0", str(first), str(second)])
+
+    with pytest.raises(AppError, match="failed after 1 attempts"):
         run_upload_locked(args)
 
-    assert rendered == [first, second]
-    assert prepare_calls == 0
+    checkpoint = state.inspect()
+    assert checkpoint is not None
+    assert checkpoint.completed_sources == (1,)
+    assert prepared_paths == [first, second]
+
+    assert run_upload_locked(args) == 0
+    assert prepared_paths == [first, second, second]
+    assert len(second_sender.calls) == 1
+    assert second_sender.calls[0][0].path == second
+    assert state.inspect() is None
 
 
-def test_run_upload_preflights_all_sizes_before_sending(
+def test_all_paths_and_captions_are_validated_before_state_or_sender(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     first = tmp_path / "first.mp4"
-    oversized = tmp_path / "oversized.mp4"
     first.write_bytes(b"video")
-    with oversized.open("wb") as file:
-        file.truncate(SAFE_UPLOAD_LIMIT_BYTES + 1)
+    state_created = False
 
-    args = build_parser().parse_args(
-        [
-            "upload",
-            "--profile",
-            "default",
-            str(first),
-            str(oversized),
-        ]
-    )
-    calls = 0
-
-    def fake_send_video(
-        config: AppConfig,
-        profile: ProfileConfig,
-        path: Path,
-        caption: str,
-    ) -> dict[str, Any]:
-        nonlocal calls
-        calls += 1
-        return {"message_id": 42}
+    def forbidden_store(*args: Any, **kwargs: Any) -> Any:
+        nonlocal state_created
+        state_created = True
+        raise AssertionError("state must not be created")
 
     monkeypatch.setattr("tg_comment_uploader.cli.load_config", lambda path: fake_config())
-    monkeypatch.setattr("tg_comment_uploader.cli.send_video", fake_send_video)
-    monkeypatch.setattr("tg_comment_uploader.cli.upload_instance_lock", nullcontext)
+    monkeypatch.setattr("tg_comment_uploader.cli.create_pending_store", forbidden_store)
+    args = build_parser().parse_args(["upload", str(first), str(tmp_path / "missing.mp4")])
 
-    with pytest.raises(NonRetryableUploadError, match="No upload was attempted"):
-        run_upload(args)
+    with pytest.raises(AppError, match="does not exist"):
+        run_upload_locked(args)
+    assert state_created is False
 
-    assert calls == 0
-
-
-def test_upload_with_retries_stops_after_success(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = 0
-    sleeps: list[int] = []
 
-    def fake_send_video(
-        config: AppConfig,
-        profile: ProfileConfig,
-        path: Path,
-        caption: str,
-    ) -> dict[str, Any]:
+    def fail_second(template: str, path: Path) -> str:
         nonlocal calls
         calls += 1
-        if calls < 3:
-            raise RetryableUploadError("temporary failure")
-        return {"message_id": 42}
+        if calls == 2:
+            raise AppError("caption failed")
+        return "ok"
 
-    monkeypatch.setattr("tg_comment_uploader.cli.send_video", fake_send_video)
-    monkeypatch.setattr("tg_comment_uploader.cli.time.sleep", sleeps.append)
-
-    result = upload_with_retries(
-        fake_config(),
-        fake_profile(),
-        Path("/videos/a.mp4"),
-        "a",
-        retries=5,
-    )
-
-    assert result == {"message_id": 42}
-    assert calls == 3
-    assert sleeps == [1, 2]
+    second = tmp_path / "second.mp4"
+    second.write_bytes(b"video")
+    monkeypatch.setattr("tg_comment_uploader.cli.render_caption", fail_second)
+    args = build_parser().parse_args(["upload", str(first), str(second)])
+    with pytest.raises(AppError, match="caption failed"):
+        run_upload_locked(args)
+    assert state_created is False
 
 
-def test_upload_with_retries_fails_after_retry_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = 0
-    sleeps: list[int] = []
-
-    def fake_send_video(
-        config: AppConfig,
-        profile: ProfileConfig,
-        path: Path,
-        caption: str,
-    ) -> dict[str, Any]:
-        nonlocal calls
-        calls += 1
-        raise RetryableUploadError("still failing")
-
-    monkeypatch.setattr("tg_comment_uploader.cli.send_video", fake_send_video)
-    monkeypatch.setattr("tg_comment_uploader.cli.time.sleep", sleeps.append)
-
-    with pytest.raises(AppError, match="failed after 3 attempts"):
-        upload_with_retries(
-            fake_config(),
-            fake_profile(),
-            Path("/videos/a.mp4"),
-            "a",
-            retries=2,
-        )
-
-    assert calls == 3
-    assert sleeps == [1, 2]
-
-
-def test_exponential_backoff_is_capped(monkeypatch: pytest.MonkeyPatch) -> None:
-    sleeps: list[int] = []
-
-    def always_fail() -> None:
-        raise RetryableUploadError("temporary failure")
-
-    monkeypatch.setattr("tg_comment_uploader.cli.time.sleep", sleeps.append)
-
-    with pytest.raises(AppError, match="failed after 8 attempts"):
-        retry_upload(always_fail, label="video", retries=7)
-
-    assert sleeps == [1, 2, 4, 8, 16, 30, 30]
-
-
-def test_uncertain_outcome_warns_before_retrying(
+def test_pending_status_and_discard_output_are_private(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = 0
-    sleeps: list[int] = []
-
-    def action() -> dict[str, int]:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise RetryableUploadError(
-                "upload outcome is uncertain",
-                outcome_uncertain=True,
-            )
-        return {"message_id": 42}
-
-    monkeypatch.setattr("tg_comment_uploader.cli.time.sleep", sleeps.append)
-
-    result = retry_upload(
-        action,
-        label="video",
-        retries=1,
-    )
-
-    captured = capsys.readouterr()
-    assert result == {"message_id": 42}
-    assert sleeps == [1]
-    assert "WARNING: the previous upload may already have succeeded" in captured.err
-    assert "duplicate Telegram messages or media groups" in captured.err
-
-
-def test_non_retryable_upload_error_stops_immediately(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls = 0
-
-    def fake_send_video(
-        config: AppConfig,
-        profile: ProfileConfig,
-        path: Path,
-        caption: str,
-    ) -> dict[str, Any]:
-        nonlocal calls
-        calls += 1
-        raise NonRetryableUploadError("FILE_PARTS_INVALID; not retrying")
-
-    monkeypatch.setattr("tg_comment_uploader.cli.send_video", fake_send_video)
-
-    with pytest.raises(NonRetryableUploadError, match="FILE_PARTS_INVALID"):
-        upload_with_retries(
-            fake_config(),
-            fake_profile(),
-            Path("/videos/a.mp4"),
-            "a",
-            retries=5,
-        )
-
-    assert calls == 1
-
-
-def test_retry_after_is_respected(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = 0
-    sleeps: list[int] = []
-
-    def fake_send_video(
-        config: AppConfig,
-        profile: ProfileConfig,
-        path: Path,
-        caption: str,
-    ) -> dict[str, Any]:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise RetryableUploadError("rate limited", retry_after_seconds=3)
-        return {"message_id": 42}
-
-    monkeypatch.setattr("tg_comment_uploader.cli.send_video", fake_send_video)
-    monkeypatch.setattr("tg_comment_uploader.cli.time.sleep", sleeps.append)
-
-    result = upload_with_retries(
-        fake_config(),
-        fake_profile(),
-        Path("/videos/a.mp4"),
-        "a",
-        retries=1,
-    )
-
-    assert result == {"message_id": 42}
-    assert sleeps == [3]
-
-
-def test_bot_api_error_classification(tmp_path: Path) -> None:
-    video = tmp_path / "a.mp4"
-    video.write_bytes(b"video")
-
-    file_parts_error = make_bot_api_error(
-        {
-            "ok": False,
-            "error_code": 400,
-            "description": "Bad Request: FILE_PARTS_INVALID",
-        },
-        http_status=400,
-        file_path=video,
-    )
-    bad_request_error = make_bot_api_error(
-        {
-            "ok": False,
-            "error_code": 400,
-            "description": "Bad Request: message to be replied not found",
-        },
-        http_status=400,
-        file_path=video,
-    )
-    request_timeout_error = make_bot_api_error(
-        {
-            "ok": False,
-            "error_code": 408,
-            "description": "Request Timeout",
-        },
-        http_status=408,
-        file_path=video,
-    )
-    server_error = make_bot_api_error(
-        {
-            "ok": False,
-            "error_code": 503,
-            "description": "Service Unavailable",
-        },
-        http_status=503,
-        file_path=video,
-    )
-    rate_limit_error = make_bot_api_error(
-        {
-            "ok": False,
-            "error_code": 429,
-            "description": "Too Many Requests",
-            "parameters": {"retry_after": 17},
-        },
-        http_status=429,
-        file_path=video,
-    )
-    header_rate_limit_error = make_bot_api_error(
-        {
-            "ok": False,
-            "error_code": 429,
-            "description": "Too Many Requests",
-        },
-        http_status=429,
-        file_path=video,
-        retry_after_header="23",
-    )
-
-    assert isinstance(file_parts_error, NonRetryableUploadError)
-    assert "file-part count" in str(file_parts_error)
-    assert isinstance(bad_request_error, NonRetryableUploadError)
-    assert isinstance(request_timeout_error, RetryableUploadError)
-    assert request_timeout_error.outcome_uncertain is False
-    assert isinstance(server_error, RetryableUploadError)
-    assert server_error.outcome_uncertain is False
-    assert isinstance(rate_limit_error, RetryableUploadError)
-    assert rate_limit_error.retry_after_seconds == 17
-    assert "retry_after=17s" in str(rate_limit_error)
-    assert isinstance(header_rate_limit_error, RetryableUploadError)
-    assert header_rate_limit_error.retry_after_seconds == 23
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {},
-        {"ok": True},
-        {"ok": 0},
-        {"description": "Bad Request: FILE_PARTS_INVALID"},
-    ],
-    ids=["missing-ok", "ok-true", "ok-zero", "file-parts-without-explicit-false"],
-)
-def test_retryable_bot_api_response_without_explicit_false_is_uncertain(
-    tmp_path: Path,
-    payload: dict[str, Any],
-) -> None:
-    video = tmp_path / "a.mp4"
-    video.write_bytes(b"video")
-
-    error = make_bot_api_error(
-        payload,
-        http_status=503,
-        file_path=video,
-        retry_after_header="7",
-    )
-
-    assert isinstance(error, RetryableUploadError)
-    assert error.outcome_uncertain is True
-    assert error.retry_after_seconds == 7
-    assert "request may already have succeeded" in str(error)
-
-
-@pytest.mark.parametrize("terminator", ["/sendVideo", "?method=sendVideo", "#fragment", " ", ""])
-def test_untrusted_error_text_redacts_bot_token_for_common_terminators(
-    terminator: str,
-) -> None:
-    cleaned = sanitize_untrusted_error_text(f"https://localhost/bot123456:SUPER_SECRET{terminator}")
-
-    assert "123456:SUPER_SECRET" not in cleaned
-    assert "/bot<redacted>" in cleaned
-
-
-def test_untrusted_error_text_escapes_controls_and_truncates() -> None:
-    cleaned = sanitize_untrusted_error_text("正常文本\x1b[31m\a\r\n\t\u202e" + ("x" * 1_000))
-
-    assert cleaned.startswith("正常文本\\x1b[31m\\x07\\r\\n\\t\\u202e")
-    assert "\x1b" not in cleaned
-    assert "\a" not in cleaned
-    assert "\r" not in cleaned
-    assert "\n" not in cleaned
-    assert "\t" not in cleaned
-    assert "\u202e" not in cleaned
-    assert len(cleaned) == MAX_UNTRUSTED_ERROR_TEXT_LENGTH
-    assert cleaned.endswith("...<truncated>")
-
-
-def test_transport_error_sanitizes_untrusted_protocol_exception() -> None:
-    protocol_text = "bad response from /bot123456:SUPER_SECRET/sendVideo\x1b[31m\n" + ("x" * 1_000)
-
-    error = make_transport_error(
-        "127.0.0.1",
-        48973,
-        http.client.HTTPException(protocol_text),
-        request_body_sent=True,
-        http_status=503,
-        retry_after_header="9",
-    )
-
-    message = str(error)
-    assert isinstance(error, RetryableUploadError)
-    assert error.outcome_uncertain is True
-    assert error.retry_after_seconds == 9
-    assert "123456:SUPER_SECRET" not in message
-    assert "/bot<redacted>/sendVideo" in message
-    assert "\x1b" not in message
-    assert "\n" not in message
-    assert "\\x1b" in message
-    assert "\\n" in message
-    assert "...<truncated>" in message
-
-
-def test_bot_api_description_is_sanitized_without_changing_file_parts_classification(
-    tmp_path: Path,
-) -> None:
-    video = tmp_path / "video.mp4"
-    video.write_bytes(b"video")
-    description = "/bot123456:SUPER_SECRET/sendVideo\a" + ("x" * 600) + " FILE_PARTS_INVALID"
-
-    error = make_bot_api_error(
-        {
-            "ok": False,
-            "error_code": 400,
-            "description": description,
-        },
-        http_status=400,
-        file_path=video,
-    )
-
-    message = str(error)
-    assert isinstance(error, NonRetryableUploadError)
-    assert "file-part count" in message
-    assert "123456:SUPER_SECRET" not in message
-    assert "/bot<redacted>/sendVideo" in message
-    assert "\a" not in message
-    assert "\\x07" in message
-    assert "...<truncated>" in message
-
-
-def test_transport_error_classification() -> None:
-    before_body_complete = make_transport_error(
-        "127.0.0.1",
-        48973,
-        ConnectionResetError("reset"),
-        request_body_sent=False,
-        http_status=None,
-        retry_after_header=None,
-    )
-    after_body_complete = make_transport_error(
-        "127.0.0.1",
-        48973,
-        TimeoutError("timed out"),
-        request_body_sent=True,
-        http_status=None,
-        retry_after_header=None,
-    )
-    known_bad_request = make_transport_error(
-        "127.0.0.1",
-        48973,
-        http.client.IncompleteRead(b""),
-        request_body_sent=True,
-        http_status=400,
-        retry_after_header=None,
-    )
-    known_rate_limit = make_transport_error(
-        "127.0.0.1",
-        48973,
-        http.client.IncompleteRead(b""),
-        request_body_sent=True,
-        http_status=429,
-        retry_after_header="11",
-    )
-    interrupted_server_error = make_transport_error(
-        "127.0.0.1",
-        48973,
-        http.client.IncompleteRead(b""),
-        request_body_sent=True,
-        http_status=503,
-        retry_after_header="7",
-    )
-
-    assert isinstance(before_body_complete, RetryableUploadError)
-    assert isinstance(known_rate_limit, RetryableUploadError)
-    assert isinstance(interrupted_server_error, RetryableUploadError)
-    assert before_body_complete.outcome_uncertain is False
-    assert known_rate_limit.outcome_uncertain is True
-    assert interrupted_server_error.retry_after_seconds == 7
-    assert interrupted_server_error.outcome_uncertain is True
-    assert isinstance(after_body_complete, RetryableUploadError)
-    assert after_body_complete.outcome_uncertain is True
-    assert "may already have succeeded" in str(after_body_complete)
-    assert isinstance(known_bad_request, NonRetryableUploadError)
-    assert known_rate_limit.retry_after_seconds == 11
-
-
-def test_protocol_error_uses_retry_after_header() -> None:
-    rate_limit = response_protocol_error(
-        429,
-        "invalid rate-limit response",
-        retry_after_header="13",
-    )
-    uncertain_success = response_protocol_error(200, "invalid success response")
-    malformed_server_error = response_protocol_error(
-        503,
-        "invalid server-error response",
-        retry_after_header="5",
-    )
-
-    assert isinstance(rate_limit, RetryableUploadError)
-    assert rate_limit.retry_after_seconds == 13
-    assert rate_limit.outcome_uncertain is True
-    assert isinstance(uncertain_success, RetryableUploadError)
-    assert uncertain_success.outcome_uncertain is True
-    assert isinstance(malformed_server_error, RetryableUploadError)
-    assert malformed_server_error.retry_after_seconds == 5
-    assert malformed_server_error.outcome_uncertain is True
-
-
-def fake_config() -> AppConfig:
-    return AppConfig(
-        bot=BotConfig(token="token", api_id=1, api_hash="hash"),
-        server=ServerConfig(
-            host="127.0.0.1",
-            port=48973,
-            binary="telegram-bot-api",
-            work_dir=Path("."),
-        ),
-        profiles={"default": fake_profile()},
-    )
-
-
-def fake_profile(reply_message_id: int | None = 12345) -> ProfileConfig:
-    return ProfileConfig(
-        chat_id="-1001234567890",
-        reply_message_id=reply_message_id,
-        caption="{stem}",
-        supports_streaming=True,
-    )
-
-
-def test_upload_connection_refused_retries_and_points_to_server_command(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = AppConfig(
-        bot=BotConfig(token="token", api_id=1, api_hash="hash"),
-        server=ServerConfig(
-            host="127.0.0.1",
-            port=9,
-            binary="telegram-bot-api",
-            work_dir=Path("."),
-        ),
-        profiles={"default": fake_profile()},
-    )
-
-    video = tmp_path / "a.mp4"
-    sleeps: list[int] = []
-    video.write_bytes(b"video")
-
-    class RefusedConnection:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            pass
-
-        def putrequest(self, *args: Any, **kwargs: Any) -> None:
-            raise ConnectionRefusedError("refused")
-
-        def close(self) -> None:
-            pass
-
-    monkeypatch.setattr("tg_comment_uploader.cli.http.client.HTTPConnection", RefusedConnection)
-    monkeypatch.setattr("tg_comment_uploader.cli.time.sleep", sleeps.append)
-
-    with pytest.raises(AppError, match="Start it first in another terminal with: just server"):
-        upload_with_retries(
-            config,
-            fake_profile(),
-            video,
-            "a",
-            retries=1,
-        )
-
-    captured = capsys.readouterr()
-    assert "attempt 1/2" in captured.out
-    assert "attempt 2/2" in captured.out
-    assert sleeps == [1]
-
-
-def test_progress_format_helpers() -> None:
-    assert format_bytes(0) == "0 B"
-    assert format_bytes(1024) == "1.0 KiB"
-    assert format_bytes(1024 * 1024) == "1.0 MiB"
-    assert format_duration(0) == "0:00"
-    assert format_duration(65) == "1:05"
-    assert format_duration(3661) == "1:01:01"
-
-
-class ProgressStream(io.StringIO):
-    def __init__(self, *, is_tty: bool) -> None:
-        super().__init__()
-        self._is_tty = is_tty
-
-    def isatty(self) -> bool:
-        return self._is_tty
-
-
-def test_upload_progress_tty_pads_shorter_line_to_clear_residual_text(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stream = ProgressStream(is_tty=True)
-    monkeypatch.setattr("tg_comment_uploader.cli.sys.stdout", stream)
-    monkeypatch.setattr("tg_comment_uploader.cli.time.monotonic", lambda: 10.0)
-
-    width = print_progress(
-        100,
-        100,
-        0.0,
-        force=True,
-        previous_width=160,
-    )
-
-    output = stream.getvalue()
-    assert width < 160
-    assert output.startswith("\rprogress: 100.00%")
-    assert output.endswith(" " * (160 - width))
-
-
-def test_upload_progress_non_tty_is_a_complete_line_without_carriage(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stream = ProgressStream(is_tty=False)
-    monkeypatch.setattr("tg_comment_uploader.cli.sys.stdout", stream)
-    monkeypatch.setattr("tg_comment_uploader.cli.time.monotonic", lambda: 10.0)
-
-    width = print_progress(50, 100, 0.0, force=True, previous_width=99)
-
-    assert width == 0
-    assert "\r" not in stream.getvalue()
-    assert stream.getvalue().startswith("progress:  50.00%")
-    assert stream.getvalue().endswith("\n")
-
-
-def test_upload_progress_tty_finishes_line_when_sending_raises(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stream = ProgressStream(is_tty=True)
-    video = tmp_path / "video.mp4"
-    video.write_bytes(b"video")
-
-    class BrokenConnection:
-        def send(self, chunk: bytes) -> None:
-            raise RuntimeError("send failed")
-
-    monkeypatch.setattr("tg_comment_uploader.cli.sys.stdout", stream)
-    monkeypatch.setattr("tg_comment_uploader.cli.time.monotonic", lambda: 10.0)
-
-    connection: Any = BrokenConnection()
-    with video.open("rb") as upload_file:
-        with pytest.raises(RuntimeError, match="send failed"):
-            send_file_with_progress(
-                connection,
-                upload_file,
-                video,
-                video.stat().st_size,
-            )
-
-    assert stream.getvalue().startswith("\rprogress:")
-    assert stream.getvalue().endswith("\n")
-
-
-@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes are not portable")
-def test_run_server_uses_child_only_credentials_and_secures_work_dir(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    work_dir = tmp_path / "telegram-bot-api"
-    work_dir.mkdir()
-    work_dir.chmod(0o755)
-    config = AppConfig(
-        bot=BotConfig(token="token", api_id=123456, api_hash="test-api-hash"),
-        server=ServerConfig(
-            host="127.0.0.1",
-            port=48973,
-            binary="telegram-bot-api",
-            work_dir=work_dir,
-        ),
-        profiles={},
-    )
-    captured: dict[str, Any] = {}
-
-    class Result:
-        returncode = 0
-
-    def fake_run(command: list[str], **kwargs: Any) -> Result:
-        captured["command"] = command
-        captured.update(kwargs)
-        return Result()
-
-    monkeypatch.setenv("TG_TEST_PARENT", "preserved")
-    monkeypatch.delenv("TELEGRAM_API_ID", raising=False)
-    monkeypatch.delenv("TELEGRAM_API_HASH", raising=False)
-    monkeypatch.setattr("tg_comment_uploader.cli.load_config", lambda path: config)
+    sender = FakeSender()
+    state, _ = install_runtime_fakes(tmp_path, monkeypatch, sender)
+    monkeypatch.setattr("tg_comment_uploader.cli.load_config", lambda path: fake_config())
     monkeypatch.setattr(
-        "tg_comment_uploader.cli.shutil.which",
-        lambda binary: "/usr/bin/telegram-bot-api",
+        "tg_comment_uploader.cli.upload_instance_lock",
+        lambda: __import__("contextlib").nullcontext(),
     )
-    monkeypatch.setattr("tg_comment_uploader.cli.subprocess.run", fake_run)
+    status_args = build_parser().parse_args(["pending-status"])
+    assert status_args.func(status_args) == 0
+    assert "pending upload: <none>" in capsys.readouterr().out
 
-    args = build_parser().parse_args(["server", "--config", str(tmp_path / "config.json")])
+    video = tmp_path / "private-name.mp4"
+    video.write_bytes(b"x")
+    digest = hashlib.sha256(b"x").hexdigest()
+    from tg_comment_uploader.upload_state import (
+        FileIdentity,
+        SourceIntent,
+        UploadIntent,
+        UploadUnitSpec,
+    )
 
-    assert run_server(args) == 0
-    command = captured["command"]
-    assert command == [
-        "/usr/bin/telegram-bot-api",
-        "--local",
-        "--http-ip-address",
-        "127.0.0.1",
-        "--http-port",
-        "48973",
-    ]
-    assert "--api-id" not in command
-    assert "--api-hash" not in command
-    assert "test-api-hash" not in command
-    assert "123456" not in command
-    assert captured["cwd"] == work_dir
-    assert captured["check"] is False
+    file_identity = FileIdentity(str(video), 1, digest)
+    pending = state.open_or_create(
+        UploadIntent(
+            profile_name="default",
+            chat_id="-1001",
+            reply_message_id=None,
+            supports_streaming=True,
+            oversize_policy="error",
+            sources=(SourceIntent(file_identity, "secret caption"),),
+        )
+    )
+    assert status_args.func(status_args) == 0
+    status_output = capsys.readouterr().out
+    assert pending.operation_id in status_output
+    assert "owner: current" in status_output
+    assert "stage: planned" in status_output
+    assert "private-name" not in status_output
+    assert "secret caption" not in status_output
 
-    child_env = captured["env"]
-    assert child_env["TELEGRAM_API_ID"] == "123456"
-    assert child_env["TELEGRAM_API_HASH"] == "test-api-hash"
-    assert child_env["TG_TEST_PARENT"] == "preserved"
-    assert "TELEGRAM_API_ID" not in os.environ
-    assert "TELEGRAM_API_HASH" not in os.environ
-    assert work_dir.stat().st_mode & 0o777 == 0o700
+    unit = state.register_unit(
+        UploadUnitSpec(
+            key="source:1/single",
+            source_index=1,
+            preparation="original",
+            files=(file_identity,),
+        )
+    )
+    state.bind_peer(-1001)
+    state.mark_sending(unit.key)
+    state.mark_confirmed(unit.key, (101,))
+    assert status_args.func(status_args) == 0
+    partially_confirmed_output = capsys.readouterr().out
+    assert "stage: partially-confirmed" in partially_confirmed_output
+    assert "stage: planned" not in partially_confirmed_output
+
+    state.mark_source_completed(1)
+    assert status_args.func(status_args) == 0
+    assert "stage: confirmed" in capsys.readouterr().out
+
+    discard_args = build_parser().parse_args(
+        ["pending-discard", "--operation-id", pending.operation_id]
+    )
+    assert discard_args.func(discard_args) == 0
+    assert state.inspect() is None
+    discarded = capsys.readouterr()
+    assert "new Telegram random IDs" in discarded.out
+    assert "may create a duplicate Telegram message or media group" in discarded.err
+
+
+def test_pending_maintenance_can_inspect_and_explicitly_discard_foreign_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from tg_comment_uploader.upload_state import (
+        FileIdentity,
+        SourceIntent,
+        UploadIntent,
+        UploadUnitSpec,
+    )
+
+    state_path = tmp_path / "pending.json"
+    original_owner = PendingOwner(config_fingerprint="a" * 64, bot_id=111)
+    original_store = PendingUploadStore(state_path, owner=original_owner)
+    video = tmp_path / "private-name.mp4"
+    video.write_bytes(b"x")
+    file_identity = FileIdentity(str(video), 1, hashlib.sha256(b"x").hexdigest())
+    pending = original_store.open_or_create(
+        UploadIntent(
+            profile_name="default",
+            chat_id="-1001",
+            reply_message_id=None,
+            supports_streaming=True,
+            oversize_policy="error",
+            sources=(SourceIntent(file_identity, "private caption"),),
+        )
+    )
+    unit = original_store.register_unit(
+        UploadUnitSpec(
+            key="source:1/single",
+            source_index=1,
+            preparation="original",
+            files=(file_identity,),
+        )
+    )
+    original_store.bind_peer(-1001)
+    original_store.mark_sending(unit.key)
+
+    current_owner = PendingOwner(config_fingerprint="b" * 64, bot_id=222)
+    maintenance_store = PendingUploadStore(state_path, owner=current_owner)
+    paths = MtprotoPaths(
+        pending_path=state_path,
+        session_path=tmp_path / "sessions/current.session",
+        owner=current_owner,
+    )
+    monkeypatch.setattr("tg_comment_uploader.cli.load_config", lambda path: fake_config())
+    monkeypatch.setattr(
+        "tg_comment_uploader.cli.create_pending_store",
+        lambda config_path, bot: (paths, maintenance_store),
+    )
+    monkeypatch.setattr(
+        "tg_comment_uploader.cli.upload_instance_lock",
+        lambda: __import__("contextlib").nullcontext(),
+    )
+
+    status_args = build_parser().parse_args(["pending-status"])
+    assert status_args.func(status_args) == 0
+    status_output = capsys.readouterr().out
+    assert pending.operation_id in status_output
+    assert "owner: foreign" in status_output
+    assert "stage: sending" in status_output
+    assert "private-name" not in status_output
+    assert "private caption" not in status_output
+
+    unforced = build_parser().parse_args(
+        ["pending-discard", "--operation-id", pending.operation_id]
+    )
+    with pytest.raises(AppError, match="--force-foreign-owner"):
+        unforced.func(unforced)
+    assert state_path.exists()
+
+    wrong_id = build_parser().parse_args(
+        [
+            "pending-discard",
+            "--operation-id",
+            "wrong",
+            "--force-foreign-owner",
+        ]
+    )
+    with pytest.raises(AppError, match="operation ID"):
+        wrong_id.func(wrong_id)
+    assert state_path.exists()
+
+    forced = build_parser().parse_args(
+        [
+            "pending-discard",
+            "--operation-id",
+            pending.operation_id,
+            "--force-foreign-owner",
+        ]
+    )
+    assert forced.func(forced) == 0
+    assert not state_path.exists()
+    discarded = capsys.readouterr()
+    assert "discarded foreign-owner pending upload" in discarded.out
+    assert "may create a duplicate Telegram message or media group" in discarded.err

@@ -12,9 +12,9 @@ from typing import Self, TextIO
 
 BAR_WIDTH = 20
 NON_TTY_REPORT_INTERVAL_SECONDS = 10.0
-RESPONSE_WAIT_MESSAGE = "request sent to local Bot API; waiting for Telegram response"
-TTY_RESPONSE_WAIT_INTERVAL_SECONDS = 1.0
-NON_TTY_RESPONSE_WAIT_INTERVAL_SECONDS = 30.0
+TELEGRAM_CONFIRMATION_WAIT_MESSAGE = "final MTProto request sent; waiting for Telegram confirmation"
+TTY_CONFIRMATION_WAIT_INTERVAL_SECONDS = 1.0
+NON_TTY_CONFIRMATION_WAIT_INTERVAL_SECONDS = 30.0
 SPINNER_FRAMES = ("|", "/", "-", "\\")
 
 Clock = Callable[[], float]
@@ -169,8 +169,8 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes:d}:{secs:02d}"
 
 
-class ResponseWaitIndicator:
-    """Show elapsed time while a sent Bot API request awaits its response."""
+class TelegramConfirmationWaitIndicator:
+    """Show elapsed time while a final MTProto send awaits confirmation."""
 
     def __init__(
         self,
@@ -187,15 +187,15 @@ class ResponseWaitIndicator:
             self._is_tty = False
 
         default_interval = (
-            TTY_RESPONSE_WAIT_INTERVAL_SECONDS
+            TTY_CONFIRMATION_WAIT_INTERVAL_SECONDS
             if self._is_tty
-            else NON_TTY_RESPONSE_WAIT_INTERVAL_SECONDS
+            else NON_TTY_CONFIRMATION_WAIT_INTERVAL_SECONDS
         )
         self._interval_seconds = (
             default_interval if interval_seconds is None else float(interval_seconds)
         )
         if not math.isfinite(self._interval_seconds) or self._interval_seconds <= 0:
-            raise ValueError("response wait interval must be finite and positive")
+            raise ValueError("Telegram confirmation wait interval must be finite and positive")
 
         self._stop_event = Event()
         self._write_lock = Lock()
@@ -247,7 +247,7 @@ class ResponseWaitIndicator:
         try:
             thread = Thread(
                 target=self._run,
-                name="tg-comment-uploader-response-wait",
+                name="tg-comment-uploader-confirmation-wait",
                 daemon=True,
             )
             self._thread = thread
@@ -285,7 +285,7 @@ class ResponseWaitIndicator:
             thread.join()
         except Exception:
             # The stop event is already set and the worker is a daemon, so a
-            # reporting failure must not alter the HTTP request outcome.
+            # reporting failure must not alter the Telegram request outcome.
             pass
         finally:
             self._thread = None
@@ -309,14 +309,16 @@ class ResponseWaitIndicator:
         with self._write_lock:
             if self._is_tty:
                 frame = SPINNER_FRAMES[self._frame_index % len(SPINNER_FRAMES)]
-                line = f"{frame} {RESPONSE_WAIT_MESSAGE} (elapsed {elapsed_text})"
+                line = f"{frame} {TELEGRAM_CONFIRMATION_WAIT_MESSAGE} (elapsed {elapsed_text})"
                 padding = " " * max(self._rendered_width - len(line), 0)
                 self._stream.write(f"\r{line}{padding}")
                 self._rendered_width = len(line)
                 self._line_open = True
                 self._frame_index += 1
             else:
-                self._stream.write(f"{RESPONSE_WAIT_MESSAGE} (elapsed {elapsed_text})\n")
+                self._stream.write(
+                    f"{TELEGRAM_CONFIRMATION_WAIT_MESSAGE} (elapsed {elapsed_text})\n"
+                )
             self._stream.flush()
 
     def _safe_finish_line(self) -> None:

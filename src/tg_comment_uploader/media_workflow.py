@@ -2,23 +2,28 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
+import stat
 import shutil
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 from .media_compress import CompressionError, CompressionProgress, compress_video
 from .media_split import MediaSplitError, SplitProgress, split_video
+from .upload_contract import OVERSIZE_POLICIES, OversizePolicy
 
-OversizePolicy = Literal["error", "split", "compress"]
 ProgressCallback = Callable[[str], None]
 SplitProgressCallback = Callable[[SplitProgress], None]
 CompressionProgressCallback = Callable[[CompressionProgress], None]
 WarningCallback = Callable[[str], None]
 
 WORK_DIRECTORY_NAME = ".tg-comment-uploader-work"
+SNAPSHOT_DIRECTORY_NAME = "input"
+OUTPUT_DIRECTORY_NAME = "output"
+SNAPSHOT_COPY_CHUNK_SIZE = 1024 * 1024
 
 
 class MediaPreparationError(RuntimeError):
@@ -43,6 +48,8 @@ def prepare_media(
     source: Path,
     policy: OversizePolicy,
     *,
+    expected_source_size: int,
+    expected_source_sha256: str,
     hard_limit_bytes: int,
     target_bytes: int,
     progress: ProgressCallback | None = None,
@@ -56,8 +63,14 @@ def prepare_media(
     another source or another command invocation.
     """
 
+    _validate_expected_source_identity(expected_source_size, expected_source_sha256)
     source = _validate_source(source)
     source_size = _file_size(source)
+    if source_size != expected_source_size:
+        raise MediaPreparationError(
+            f"media source size changed since its initial fingerprint: {source}; "
+            f"expected={expected_source_size:,} bytes, found={source_size:,} bytes"
+        )
     if source_size <= hard_limit_bytes:
         yield PreparedMedia(source=source, paths=(source,), policy=policy)
         return
@@ -67,7 +80,7 @@ def prepare_media(
             f"upload file is too large: {source}; size={source_size:,} bytes, "
             f"limit={hard_limit_bytes:,} bytes; no upload was attempted"
         )
-    if policy not in {"split", "compress"}:
+    if policy not in OVERSIZE_POLICIES:
         raise ValueError(f"unsupported oversize policy: {policy}")
 
     work_dir = source.parent / WORK_DIRECTORY_NAME
@@ -75,13 +88,24 @@ def prepare_media(
 
     try:
         _reset_workspace(source, work_dir)
+        input_dir = work_dir / SNAPSHOT_DIRECTORY_NAME
+        output_dir = work_dir / OUTPUT_DIRECTORY_NAME
+        _create_private_directory(input_dir, label="snapshot input")
+        _create_private_directory(output_dir, label="media output")
+        snapshot = _create_verified_source_snapshot(
+            source,
+            input_dir,
+            expected_size=expected_source_size,
+            expected_sha256=expected_source_sha256,
+            progress=progress,
+        )
         if policy == "split":
             if split_progress is None:
                 _emit(progress, "probing, planning and losslessly splitting oversized video")
             try:
                 result = split_video(
-                    source,
-                    work_dir,
+                    snapshot,
+                    output_dir,
                     hard_limit_bytes=hard_limit_bytes,
                     target_bytes=target_bytes,
                     progress=split_progress,
@@ -98,15 +122,15 @@ def prepare_media(
                     compression_callback = _compression_progress_reporter(progress)
                 if compression_callback is None:
                     output = compress_video(
-                        source,
-                        work_dir,
+                        snapshot,
+                        output_dir,
                         hard_limit_bytes,
                         target_bytes,
                     )
                 else:
                     output = compress_video(
-                        source,
-                        work_dir,
+                        snapshot,
+                        output_dir,
                         hard_limit_bytes,
                         target_bytes,
                         progress=compression_callback,
@@ -115,7 +139,7 @@ def prepare_media(
                 raise MediaPreparationError(f"failed to compress {source}: {exc}") from exc
             paths = (output,)
 
-        _validate_prepared_paths(paths, work_dir, hard_limit_bytes=hard_limit_bytes)
+        _validate_prepared_paths(paths, output_dir, hard_limit_bytes=hard_limit_bytes)
         _emit(progress, f"prepared {len(paths)} upload file(s)")
         yield PreparedMedia(source=source, paths=paths, policy=policy)
     finally:
@@ -151,6 +175,115 @@ def _file_size(path: Path) -> int:
     return size
 
 
+def _validate_expected_source_identity(expected_size: int, expected_sha256: str) -> None:
+    if isinstance(expected_size, bool) or not isinstance(expected_size, int) or expected_size <= 0:
+        raise ValueError("expected_source_size must be a positive integer")
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise ValueError("expected_source_sha256 must be a lowercase SHA-256 hex digest")
+
+
+def _create_private_directory(path: Path, *, label: str) -> None:
+    try:
+        path.mkdir(mode=0o700, parents=False, exist_ok=False)
+        path_status = path.lstat()
+        if stat.S_ISLNK(path_status.st_mode) or not stat.S_ISDIR(path_status.st_mode):
+            raise OSError("path is not a real directory")
+        if os.name == "posix":
+            path.chmod(0o700)
+    except OSError as exc:
+        raise MediaPreparationError(
+            f"failed to create private {label} directory {path}: {exc}"
+        ) from exc
+
+
+def _create_verified_source_snapshot(
+    source: Path,
+    input_dir: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+    progress: ProgressCallback | None,
+) -> Path:
+    snapshot = input_dir / source.name
+    try:
+        with source.open("rb") as input_file:
+            initial_status = os.fstat(input_file.fileno())
+            if not stat.S_ISREG(initial_status.st_mode):
+                raise MediaPreparationError(f"media source is no longer a regular file: {source}")
+            if initial_status.st_size != expected_size:
+                raise MediaPreparationError(
+                    f"media source size changed since its initial fingerprint: {source}; "
+                    f"expected={expected_size:,} bytes, found={initial_status.st_size:,} bytes"
+                )
+
+            _emit(progress, f"copying verified source snapshot: {snapshot}")
+            digest = hashlib.sha256()
+            copied = 0
+            with snapshot.open("xb") as output_file:
+                if os.name == "posix":
+                    snapshot.chmod(0o600)
+                while copied < expected_size:
+                    chunk = input_file.read(min(SNAPSHOT_COPY_CHUNK_SIZE, expected_size - copied))
+                    if not chunk:
+                        raise MediaPreparationError(
+                            f"media source reached EOF while creating its stable snapshot: "
+                            f"{source}; expected={expected_size:,} bytes, copied={copied:,} bytes"
+                        )
+                    written = output_file.write(chunk)
+                    if written != len(chunk):
+                        raise MediaPreparationError(
+                            f"short write while creating stable source snapshot {snapshot}: "
+                            f"expected={len(chunk):,} bytes, wrote={written:,} bytes"
+                        )
+                    digest.update(chunk)
+                    copied += len(chunk)
+                if input_file.read(1):
+                    raise MediaPreparationError(
+                        f"media source grew while creating its stable snapshot: {source}"
+                    )
+                output_file.flush()
+
+            _emit(progress, f"verifying stable source snapshot: {snapshot}")
+            final_status = os.fstat(input_file.fileno())
+            if (
+                final_status.st_size != initial_status.st_size
+                or final_status.st_mtime_ns != initial_status.st_mtime_ns
+                or final_status.st_ctime_ns != initial_status.st_ctime_ns
+                or final_status.st_ino != initial_status.st_ino
+                or final_status.st_dev != initial_status.st_dev
+            ):
+                raise MediaPreparationError(
+                    f"media source changed while creating its stable snapshot: {source}"
+                )
+
+        actual_sha256 = digest.hexdigest()
+        if copied != expected_size or actual_sha256 != expected_sha256:
+            raise MediaPreparationError(
+                f"media source content changed since its initial fingerprint: {source}; "
+                "stable snapshot identity does not match; no FFmpeg process was started"
+            )
+        snapshot_status = snapshot.stat()
+        if not snapshot.is_file() or snapshot_status.st_size != expected_size:
+            raise MediaPreparationError(
+                f"stable source snapshot is missing, invalid, or incomplete: {snapshot}"
+            )
+        if os.name == "posix" and stat.S_IMODE(snapshot_status.st_mode) != 0o600:
+            raise MediaPreparationError(
+                f"stable source snapshot does not have private mode 0600: {snapshot}"
+            )
+        return snapshot
+    except MediaPreparationError:
+        raise
+    except OSError as exc:
+        raise MediaPreparationError(
+            f"failed to create stable source snapshot for {source}: {exc}"
+        ) from exc
+
+
 def _reset_workspace(source: Path, work_dir: Path) -> None:
     _validate_workspace_location(source, work_dir)
     if work_dir.is_symlink():
@@ -175,12 +308,14 @@ def _reset_workspace(source: Path, work_dir: Path) -> None:
 
 def _cleanup_workspace(source: Path, work_dir: Path) -> str | None:
     try:
-        _validate_workspace_location(source, work_dir)
-        if work_dir.is_symlink():
-            return "workspace became a symbolic link; refusing to follow it"
-        if not work_dir.exists():
+        _validate_workspace_location(source, work_dir, require_source=False)
+        try:
+            work_status = work_dir.lstat()
+        except FileNotFoundError:
             return None
-        if not work_dir.is_dir():
+        if stat.S_ISLNK(work_status.st_mode):
+            return "workspace became a symbolic link; refusing to follow it"
+        if not stat.S_ISDIR(work_status.st_mode):
             return "workspace path is no longer a directory"
         shutil.rmtree(work_dir)
     except (OSError, MediaPreparationError) as exc:
@@ -188,8 +323,13 @@ def _cleanup_workspace(source: Path, work_dir: Path) -> str | None:
     return None
 
 
-def _validate_workspace_location(source: Path, work_dir: Path) -> None:
-    expected_parent = source.parent.resolve(strict=True)
+def _validate_workspace_location(
+    source: Path,
+    work_dir: Path,
+    *,
+    require_source: bool = True,
+) -> None:
+    expected_parent = source.parent.resolve(strict=True) if require_source else source.parent
     if (
         work_dir.name != WORK_DIRECTORY_NAME
         or work_dir.parent.resolve(strict=True) != expected_parent
@@ -197,10 +337,11 @@ def _validate_workspace_location(source: Path, work_dir: Path) -> None:
         raise MediaPreparationError(
             f"refuse to use unexpected temporary workspace path: {work_dir}"
         )
-    source_resolved = source.resolve(strict=True)
-    work_resolved = work_dir.resolve(strict=False)
-    if source_resolved == work_resolved or source_resolved.is_relative_to(work_resolved):
-        raise MediaPreparationError("source video must not be inside the temporary workspace")
+    if require_source:
+        source_resolved = source.resolve(strict=True)
+        work_resolved = work_dir.resolve(strict=False)
+        if source_resolved == work_resolved or source_resolved.is_relative_to(work_resolved):
+            raise MediaPreparationError("source video must not be inside the temporary workspace")
 
 
 def _validate_prepared_paths(

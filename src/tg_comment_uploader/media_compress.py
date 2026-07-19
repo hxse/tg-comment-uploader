@@ -9,6 +9,13 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
 from typing import Callable, Literal
 
+from .ffmpeg_helpers import (
+    emit_progress,
+    is_attached_picture,
+    parse_ffmpeg_progress,
+    terminate_process,
+)
+
 DEFAULT_AUDIO_BITRATE_BPS = 128_000
 MONO_AUDIO_BITRATE_BPS = 64_000
 MIN_AUDIO_BITRATE_BPS = 48_000
@@ -99,7 +106,7 @@ def parse_probe_json(raw: str) -> MediaInfo:
         if not isinstance(item, dict):
             continue
         codec_type = item.get("codec_type")
-        if codec_type == "video" and video_stream is None and not _is_attached_picture(item):
+        if codec_type == "video" and video_stream is None and not is_attached_picture(item):
             video_stream = item
         elif codec_type == "audio" and audio_stream is None:
             audio_stream = item
@@ -290,23 +297,6 @@ def build_ffmpeg_pass_command(
     return command
 
 
-def parse_ffmpeg_progress(
-    fields: dict[str, str], duration_us: int
-) -> tuple[float | None, float | None]:
-    """Return encoded seconds and a clamped fraction from one -progress block."""
-    encoded_us = _progress_time_us(fields)
-    if encoded_us is None:
-        return None, 1.0 if fields.get("progress") == "end" else None
-
-    encoded_seconds = max(encoded_us, 0) / 1_000_000
-    if duration_us <= 0:
-        return encoded_seconds, None
-    fraction = min(max(encoded_us / duration_us, 0.0), 1.0)
-    if fields.get("progress") == "end":
-        fraction = 1.0
-    return encoded_seconds, fraction
-
-
 def compress_video(
     source: Path,
     work_dir: Path,
@@ -328,9 +318,9 @@ def compress_video(
     )
     output = work_dir / "compressed.mp4"
 
-    _emit_progress(progress, CompressionProgress(stage="probing"))
+    emit_progress(progress, CompressionProgress(stage="probing"))
     media = probe_media(source, ffprobe_binary=ffprobe_binary)
-    _emit_progress(
+    emit_progress(
         progress,
         CompressionProgress(stage="planning", duration_seconds=media.duration_seconds),
     )
@@ -353,7 +343,7 @@ def compress_video(
                         duration_seconds=media.duration_seconds,
                         fraction=0.0,
                     )
-                    _emit_progress(progress, event)
+                    emit_progress(progress, event)
                     command = build_ffmpeg_pass_command(
                         source,
                         output,
@@ -374,7 +364,7 @@ def compress_video(
             finally:
                 _remove_pass_logs(passlog_prefix)
 
-            _emit_progress(
+            emit_progress(
                 progress,
                 CompressionProgress(
                     stage="validating",
@@ -439,11 +429,6 @@ def _choose_audio_bitrate(media: MediaInfo, total_bitrate_bps: int) -> int | Non
     )
 
 
-def _is_attached_picture(stream: dict[str, object]) -> bool:
-    disposition = stream.get("disposition")
-    return isinstance(disposition, dict) and disposition.get("attached_pic") == 1
-
-
 def _stream_index(stream: dict[str, object], label: str) -> int:
     index = stream.get("index")
     if not isinstance(index, int) or isinstance(index, bool) or index < 0:
@@ -489,26 +474,6 @@ def _stream_duration_us(stream: dict[str, object]) -> int | None:
     return (microsecond_numerator + denominator - 1) // denominator
 
 
-def _progress_time_us(fields: dict[str, str]) -> int | None:
-    for key in ("out_time_us", "out_time_ms"):
-        value = fields.get(key)
-        if value is not None:
-            try:
-                return int(value)
-            except ValueError:
-                pass
-
-    value = fields.get("out_time")
-    if value is None:
-        return None
-    try:
-        hours_text, minutes_text, seconds_text = value.split(":", maxsplit=2)
-        seconds = Decimal(hours_text) * 3600 + Decimal(minutes_text) * 60 + Decimal(seconds_text)
-    except (InvalidOperation, ValueError):
-        return None
-    return int((seconds * 1_000_000).to_integral_value(rounding=ROUND_CEILING))
-
-
 def _run_ffmpeg(
     command: list[str],
     *,
@@ -548,7 +513,7 @@ def _run_ffmpeg(
                 fields[key] = value
             if key == "progress" and separator:
                 encoded_seconds, fraction = parse_ffmpeg_progress(fields, duration_us)
-                _emit_progress(
+                emit_progress(
                     progress,
                     CompressionProgress(
                         stage="compressing",
@@ -563,7 +528,7 @@ def _run_ffmpeg(
                 fields = {}
         return_code = process.wait()
     except BaseException:
-        _terminate_process(process)
+        terminate_process(process)
         raise
 
     if return_code != 0:
@@ -572,22 +537,6 @@ def _run_ffmpeg(
             f"ffmpeg pass {pass_number}/2 failed for {source} on attempt {attempt}/"
             f"{max_attempts} with exit code {return_code}: {detail}"
         )
-
-
-def _terminate_process(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-
-
-def _emit_progress(callback: ProgressCallback | None, event: CompressionProgress) -> None:
-    if callback is not None:
-        callback(event)
 
 
 def _validate_compression_inputs(

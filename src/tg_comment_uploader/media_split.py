@@ -11,6 +11,13 @@ from pathlib import Path
 from threading import Thread
 from typing import Any, Callable, Iterable, Literal, Mapping, Sequence, TextIO
 
+from .ffmpeg_helpers import (
+    emit_progress,
+    is_attached_picture,
+    parse_ffmpeg_progress,
+    terminate_process,
+)
+
 
 SplitStage = Literal["probing", "planning", "splitting", "validating"]
 
@@ -82,23 +89,6 @@ class _PartsOverLimit(Exception):
     def __init__(self, sizes: tuple[int, ...]) -> None:
         super().__init__("one or more generated parts exceed the hard limit")
         self.sizes = sizes
-
-
-def parse_probe_payload(payload: Mapping[str, Any]) -> MediaProbe:
-    """Convert an in-memory ffprobe payload using the streaming packet accumulator."""
-
-    video_stream, format_section = _parse_probe_metadata(payload)
-    video_stream_index = _strict_int(video_stream.get("index"), "video stream index")
-
-    raw_packets = payload.get("packets")
-    if not isinstance(raw_packets, list) or not raw_packets:
-        raise MediaSplitError("ffprobe response does not contain media packets")
-    return _accumulate_packets(
-        raw_packets,
-        video_stream_index=video_stream_index,
-        frame_rate=_parse_frame_rate(video_stream),
-        format_section=format_section,
-    )
 
 
 def plan_split(
@@ -250,7 +240,7 @@ def split_video(
     except OSError as exc:
         raise MediaSplitError(f"failed to secure split work directory {work_dir}: {exc}") from exc
     _clear_part_outputs(work_dir, source)
-    _emit_progress(progress, SplitProgress(stage="probing"))
+    emit_progress(progress, SplitProgress(stage="probing"))
     probe = probe_media(source, ffprobe_binary=ffprobe_binary)
     duration_seconds = float(probe.duration)
 
@@ -261,7 +251,7 @@ def split_video(
             source_size_bytes=source_size,
             target_bytes=planning_target,
         )
-        _emit_progress(
+        emit_progress(
             progress,
             SplitProgress(
                 stage="planning",
@@ -296,7 +286,7 @@ def split_video(
 
             parts = _expected_part_paths(work_dir, source, plan.part_count)
             try:
-                _emit_progress(
+                emit_progress(
                     progress,
                     SplitProgress(
                         stage="validating",
@@ -395,7 +385,7 @@ def _parse_probe_metadata(
             continue
         if raw_stream.get("codec_type") != "video":
             continue
-        if _is_attached_picture(raw_stream):
+        if is_attached_picture(raw_stream):
             continue
         video_stream = raw_stream
         break
@@ -406,11 +396,6 @@ def _parse_probe_metadata(
     if not isinstance(format_section, Mapping):
         format_section = {}
     return video_stream, format_section
-
-
-def _is_attached_picture(stream: Mapping[str, Any]) -> bool:
-    disposition = stream.get("disposition")
-    return isinstance(disposition, Mapping) and disposition.get("attached_pic") == 1
 
 
 def _probe_packet_stream(
@@ -470,7 +455,7 @@ def _probe_packet_stream(
         return_code = process.wait()
     except BaseException:
         try:
-            _terminate_process(process)
+            terminate_process(process)
         finally:
             if stderr_thread is not None:
                 stderr_thread.join()
@@ -800,46 +785,6 @@ def _parse_json_object(value: str, *, context: str) -> Mapping[str, Any]:
     return payload
 
 
-def parse_ffmpeg_progress(
-    fields: Mapping[str, str],
-    duration: Decimal,
-) -> tuple[float | None, float | None]:
-    """Return processed seconds and a clamped fraction for one progress block."""
-
-    processed_us = _progress_time_us(fields)
-    if processed_us is None:
-        return None, 1.0 if fields.get("progress") == "end" else None
-
-    processed_seconds = max(processed_us, 0) / 1_000_000
-    duration_us = int((duration * 1_000_000).to_integral_value(rounding=ROUND_CEILING))
-    if duration_us <= 0:
-        return processed_seconds, None
-    fraction = min(max(processed_us / duration_us, 0.0), 1.0)
-    if fields.get("progress") == "end":
-        fraction = 1.0
-    return processed_seconds, fraction
-
-
-def _progress_time_us(fields: Mapping[str, str]) -> int | None:
-    for key in ("out_time_us", "out_time_ms"):
-        value = fields.get(key)
-        if value is not None:
-            try:
-                return int(value)
-            except ValueError:
-                pass
-
-    value = fields.get("out_time")
-    if value is None:
-        return None
-    try:
-        hours_text, minutes_text, seconds_text = value.split(":", maxsplit=2)
-        seconds = Decimal(hours_text) * 3600 + Decimal(minutes_text) * 60 + Decimal(seconds_text)
-    except (InvalidOperation, ValueError):
-        return None
-    return int((seconds * 1_000_000).to_integral_value(rounding=ROUND_CEILING))
-
-
 def _run_ffmpeg(
     command: list[str],
     *,
@@ -882,7 +827,8 @@ def _run_ffmpeg(
         stderr_thread.start()
 
         duration_seconds = float(duration)
-        _emit_progress(
+        duration_us = int((duration * 1_000_000).to_integral_value(rounding=ROUND_CEILING))
+        emit_progress(
             progress,
             SplitProgress(
                 stage="splitting",
@@ -902,7 +848,7 @@ def _run_ffmpeg(
             if separator and key.replace("_", "").isalnum():
                 fields[key] = value
             if key == "progress" and separator:
-                processed_seconds, fraction = parse_ffmpeg_progress(fields, duration)
+                processed_seconds, fraction = parse_ffmpeg_progress(fields, duration_us)
                 event = SplitProgress(
                     stage="splitting",
                     attempt=attempt,
@@ -915,12 +861,12 @@ def _run_ffmpeg(
                 if value == "end":
                     final_event = event
                 else:
-                    _emit_progress(progress, event)
+                    emit_progress(progress, event)
                 fields = {}
         return_code = process.wait()
     except BaseException:
         try:
-            _terminate_process(process)
+            terminate_process(process)
         finally:
             if stderr_thread is not None:
                 stderr_thread.join()
@@ -942,7 +888,7 @@ def _run_ffmpeg(
                 duration_seconds=float(duration),
                 fraction=1.0,
             )
-        _emit_progress(progress, final_event)
+        emit_progress(progress, final_event)
 
     return subprocess.CompletedProcess(
         command,
@@ -966,25 +912,6 @@ def _drain_stderr(
             stream.close()
         except BaseException as close_error:
             errors.append(close_error)
-
-
-def _terminate_process(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-
-
-def _emit_progress(
-    callback: SplitProgressCallback | None,
-    event: SplitProgress,
-) -> None:
-    if callback is not None:
-        callback(event)
 
 
 def _run_command(command: list[str]) -> subprocess.CompletedProcess[str]:

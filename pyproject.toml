@@ -1,9 +1,15 @@
 [project]
 name = "tg-comment-uploader"
 version = "0.1.0"
-description = "Upload local videos to Telegram channel comments through a local Bot API server."
+description = "Upload local videos to Telegram channels and channel comments over MTProto."
 requires-python = ">=3.12"
-dependencies = ["filelock>=3.29.7,<4"]
+dependencies = [
+  "cryptg>=0.6,<1",
+  "filelock>=3.29.7,<4",
+  "hachoir>=3.3,<4",
+  "pydantic>=2.13,<3",
+  "telethon>=1.44,<2",
+]
 
 [project.scripts]
 tg-comment-uploader = "tg_comment_uploader.cli:main"

@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from tg_comment_uploader.ffmpeg_helpers import parse_ffmpeg_progress
 from tg_comment_uploader.media_split import (
     MediaProbe,
     MediaSplitError,
@@ -16,8 +17,6 @@ from tg_comment_uploader.media_split import (
     SplitPoint,
     SplitProgress,
     build_segment_command,
-    parse_ffmpeg_progress,
-    parse_probe_payload,
     plan_split,
     probe_media,
     split_video,
@@ -159,7 +158,21 @@ def stub_split_probe(
     monkeypatch: pytest.MonkeyPatch,
     payload: dict[str, Any] | None = None,
 ) -> MediaProbe:
-    probe = parse_probe_payload(payload or probe_payload())
+    payload = payload or probe_payload()
+    process = FakePopen(stdout=compact_packet_output(payload))
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        metadata = {"format": payload["format"], "streams": payload["streams"]}
+        return subprocess.CompletedProcess(command, 0, json.dumps(metadata), "")
+
+    with monkeypatch.context() as probe_context:
+        probe_context.setattr("tg_comment_uploader.media_split.subprocess.run", fake_run)
+        probe_context.setattr(
+            "tg_comment_uploader.media_split.subprocess.Popen",
+            lambda *args, **kwargs: process,
+        )
+        probe = probe_media(Path("/videos/source.mp4"))
 
     def fake_probe(source: Path, *, ffprobe_binary: str = "ffprobe") -> MediaProbe:
         del source, ffprobe_binary
@@ -188,8 +201,14 @@ def stub_packet_probe_process(
     )
 
 
-def test_parse_probe_payload_counts_all_streams_at_video_keyframes() -> None:
-    probe = parse_probe_payload(probe_payload())
+def test_probe_media_counts_all_streams_at_video_keyframes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = probe_payload()
+    process = FakePopen(stdout=compact_packet_output(payload))
+    stub_packet_probe_process(monkeypatch, process)
+
+    probe = probe_media(Path("/videos/source.mp4"))
 
     assert probe.packet_bytes == 140
     assert probe.duration == Decimal("4.000000")
@@ -202,14 +221,18 @@ def test_parse_probe_payload_counts_all_streams_at_video_keyframes() -> None:
     )
 
 
-def test_parse_probe_payload_rejects_missing_internal_video_keyframes() -> None:
+def test_probe_media_rejects_missing_internal_video_keyframes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     payload = probe_payload()
     for packet in payload["packets"]:
         if packet["stream_index"] == 0 and packet["pts_time"] != "0.000000":
             packet["flags"] = "___"
+    process = FakePopen(stdout=compact_packet_output(payload))
+    stub_packet_probe_process(monkeypatch, process)
 
     with pytest.raises(MediaSplitError, match="internal video keyframes"):
-        parse_probe_payload(payload)
+        probe_media(Path("/videos/source.mp4"))
 
 
 def test_probe_media_streams_compact_packets_and_skips_attached_picture(
@@ -381,13 +404,13 @@ def test_probe_media_reports_missing_ffprobe_with_dev_shell_hint(
 def test_parse_ffmpeg_progress_uses_duration_and_clamps_fraction() -> None:
     assert parse_ffmpeg_progress(
         {"out_time_us": "1000000", "progress": "continue"},
-        Decimal("4"),
+        4_000_000,
     ) == (1.0, 0.25)
     assert parse_ffmpeg_progress(
         {"out_time": "00:00:05.000000", "progress": "end"},
-        Decimal("4"),
+        4_000_000,
     ) == (5.0, 1.0)
-    assert parse_ffmpeg_progress({"progress": "end"}, Decimal("4")) == (None, 1.0)
+    assert parse_ffmpeg_progress({"progress": "end"}, 4_000_000) == (None, 1.0)
 
 
 def test_plan_split_uses_fewest_parts_before_balancing() -> None:

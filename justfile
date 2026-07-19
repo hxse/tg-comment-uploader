@@ -13,16 +13,11 @@ dev-shell:
 
 check:
     uv run ruff format --check
+    uv run ruff check .
     uv run ty check
 
 test:
     uv run pytest
-
-server:
-    uv run python -m tg_comment_uploader server --config "{{config}}"
-
-server-config config_path:
-    uv run python -m tg_comment_uploader server --config "$1"
 
 upload +paths:
     uv run python -m tg_comment_uploader upload --config "{{config}}" --profile "{{profile}}" --retries "{{retries}}" "$@"
