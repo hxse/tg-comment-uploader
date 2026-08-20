@@ -667,6 +667,69 @@ def test_connection_error_redacts_config_secrets(tmp_path: Path) -> None:
     assert client.disconnected is True
 
 
+def test_failed_start_disconnected_future_is_observed_before_safe_retry(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "video.mp4"
+    path.write_bytes(b"video")
+
+    class TrackingFuture(asyncio.Future[None]):
+        def __init__(self) -> None:
+            super().__init__()
+            self.exception_calls = 0
+
+        def exception(self) -> BaseException | None:
+            self.exception_calls += 1
+            return super().exception()
+
+    class FailedStartClient:
+        def __init__(self) -> None:
+            self.session = SimpleNamespace(filename=None)
+            self.disconnected: TrackingFuture | None = None
+            self.disconnect_calls = 0
+
+        async def start(self, *, bot_token: str) -> FailedStartClient:
+            del bot_token
+            failure = asyncio.IncompleteReadError(partial=b"", expected=8)
+            self.disconnected = TrackingFuture()
+            self.disconnected.set_exception(failure)
+            raise failure
+
+        async def disconnect(self) -> None:
+            self.disconnect_calls += 1
+
+        def is_connected(self) -> bool:
+            return False
+
+    first_client = FailedStartClient()
+    second_client = FakeClient()
+    clients = iter((first_client, second_client))
+
+    sender = MtprotoSender(
+        api_id=12345,
+        api_hash="api-secret",
+        bot_token="123456:bot-secret",
+        session_path=tmp_path / "state" / "bot.session",
+        chat_id="-1001234567890",
+        reply_message_id=12345,
+        supports_streaming=True,
+        client_factory=lambda *args, **kwargs: next(clients),
+    )
+    item = upload_item(path)
+
+    with sender:
+        with pytest.raises(RetryableUploadError) as caught:
+            sender.send_video(item, random_id=5)
+
+        assert caught.value.outcome_uncertain is False
+        assert caught.value.final_request_started is False
+        assert first_client.disconnect_calls == 1
+        assert first_client.disconnected is not None
+        assert first_client.disconnected.exception_calls >= 1
+
+        assert sender.send_video(item, random_id=5) == 101
+
+
 def test_uncommon_extension_still_sends_as_video_and_preserves_streaming_false(
     tmp_path: Path,
 ) -> None:

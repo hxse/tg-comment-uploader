@@ -438,7 +438,15 @@ class MtprotoSender:
             )
             self._client = client
             _protect_session_files(client)
-            await client.start(bot_token=self._bot_token)
+            try:
+                await client.start(bot_token=self._bot_token)
+            finally:
+                # Telethon reports a transport failure both through the active
+                # request and through client.disconnected. The request error is
+                # handled by this sender, so also observe the lifecycle future
+                # to prevent the same exception being logged much later as an
+                # unretrieved Future during event-loop cleanup.
+                _observe_disconnected_future(client)
             me = await client.get_me()
             if me is None or getattr(me, "bot", None) is not True:
                 raise NonRetryableUploadError(
@@ -1256,6 +1264,33 @@ def _protect_session_path_candidates(session_path: Path) -> None:
 
 async def _disconnect_client(client: Any) -> None:
     await client.disconnect()
+
+
+def _observe_disconnected_future(client: Any) -> None:
+    try:
+        disconnected = getattr(client, "disconnected", None)
+    except Exception:
+        # Observing a diagnostic lifecycle future must never alter Telegram
+        # delivery or cleanup semantics.
+        return
+
+    if not isinstance(disconnected, asyncio.Future):
+        return
+    if disconnected.done():
+        _consume_future_exception(disconnected)
+    else:
+        disconnected.add_done_callback(_consume_future_exception)
+
+
+def _consume_future_exception(future: asyncio.Future[Any]) -> None:
+    if future.cancelled():
+        return
+    try:
+        # exception() marks the outcome as retrieved without removing it;
+        # another waiter can still observe the same result or exception.
+        future.exception()
+    except (asyncio.CancelledError, asyncio.InvalidStateError):
+        pass
 
 
 async def _await_operation_task(
