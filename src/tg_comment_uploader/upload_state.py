@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import secrets
 import stat
@@ -14,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from .state_io import fsync_directory as _fsync_directory, write_private_json
 from .errors import AppError
 from .locking import find_project_root
 from .strict_json import StrictJsonError, load_strict_json
@@ -564,39 +564,7 @@ class PendingUploadStore:
             ) from exc
 
     def _write(self, pending: PendingUpload) -> None:
-        parent = self.path.parent
-        _ensure_private_directory(parent)
-        temporary = parent / f".{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        payload = (
-            json.dumps(
-                _pending_to_json(pending),
-                ensure_ascii=False,
-                sort_keys=True,
-                indent=2,
-            )
-            + "\n"
-        )
-        descriptor: int | None = None
-        try:
-            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
-                descriptor = None
-                output.write(payload)
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, self.path)
-            if os.name == "posix":
-                self.path.chmod(0o600)
-            _fsync_directory(parent)
-        except OSError as exc:
-            raise AppError(f"failed to persist pending upload state: {exc}") from exc
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
+        write_private_json(self.path, _pending_to_json(pending), label="pending upload state")
 
     def _unlink(self) -> None:
         try:
@@ -862,29 +830,6 @@ def _fingerprint(domain: str, *parts: str) -> str:
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
     return digest.hexdigest()
-
-
-def _ensure_private_directory(path: Path) -> None:
-    try:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        path_status = path.lstat()
-        if stat.S_ISLNK(path_status.st_mode) or not stat.S_ISDIR(path_status.st_mode):
-            raise OSError("path is not a real directory")
-        if os.name == "posix":
-            path.chmod(0o700)
-    except OSError as exc:
-        raise AppError(f"failed to prepare private MTProto state directory {path}: {exc}") from exc
-
-
-def _fsync_directory(path: Path) -> None:
-    if os.name != "posix":
-        return
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    descriptor = os.open(path, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _now() -> str:

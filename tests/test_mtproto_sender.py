@@ -264,7 +264,7 @@ def test_send_video_uses_one_fd_raw_request_and_persistent_random_id(tmp_path: P
     assert isinstance(upload_part, functions.upload.SaveFilePartRequest)
     assert upload_part.file_part == 0
     assert upload_part.bytes == b"video"
-    assert progress == [(5, 5)]
+    assert progress == [(0, 5), (5, 5)]
     assert final_status == [True, False]
     assert resolved_peers == [-1000000000123]
     assert client.disconnected is True
@@ -546,7 +546,7 @@ def test_media_group_materializes_each_file_then_sends_one_raw_album(tmp_path: P
         )
 
     assert message_ids == (101, 102)
-    assert progress == [(0, 5, 5), (1, 5, 5)]
+    assert progress == [(0, 0, 5), (0, 5, 5), (1, 0, 5), (1, 5, 5)]
     high_level_requests = [
         request
         for request in client.requests

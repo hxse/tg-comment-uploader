@@ -6,7 +6,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import Protocol
+from typing import Any, Literal, Protocol
 
 from .errors import NonRetryableUploadError
 
@@ -39,6 +39,13 @@ def parse_bot_id(bot_token: object) -> int:
 
 
 @dataclass(frozen=True)
+class UploadThumbnail:
+    path: Path
+    expected_size: int
+    expected_sha256: str
+
+
+@dataclass(frozen=True)
 class UploadItem:
     """One local file and its already-rendered Telegram caption."""
 
@@ -46,6 +53,14 @@ class UploadItem:
     caption: str
     expected_size: int
     expected_sha256: str
+    kind: Literal["video", "document", "photo"] = "video"
+    mime_type: str | None = None
+    attributes: tuple[Any, ...] | None = None
+    entities: tuple[Any, ...] = ()
+    spoiler: bool = False
+    invert_media: bool = False
+    nosound_video: bool = True
+    thumbnail: UploadThumbnail | None = None
 
 
 def validate_upload_file_size(path: Path, size: int) -> None:

@@ -6,11 +6,13 @@
 
 这个项目用于按 profile 把本地视频依次上传到 Telegram 频道评论区，或直接发送到指定频道/群组。
 
+另有独立的 `just reupload`：监听指定频道或 Bot 私聊中的转发，下载后重新上传到同一会话。配置、支持范围和恢复方式详见 [转发备份设计与使用](reupload-design.md)。以下上传流程主要描述 `just upload`。
+
 Telegram channel comment 本质上是 linked discussion group 中的 reply。profile 配置 `reply_message_id` 时，工具向 `chat_id` 发送视频，并用 MTProto `InputReplyToMessage` 回复指定消息；省略或设为 `null` 时，视频作为 `chat_id` 中的独立消息发布。
 
 普通视频和压缩结果发送为单视频；拆分结果按 2–10 项组成相册，超过 10 项时继续使用项目既有的最少且均衡分组。
 
-超限视频算法、workspace、实例锁和媒体组规则详见 [超限视频处理设计](oversize-upload-design.md)。本文是当前系统的唯一总体设计。
+超限视频算法、workspace、实例锁和媒体组规则详见 [超限视频处理设计](oversize-upload-design.md)。
 
 核心约束：
 
@@ -18,8 +20,8 @@ Telegram channel comment 本质上是 linked discussion group 中的 reply。pro
 - Python 运行时依赖固定为 `telethon>=1.44,<2`、`cryptg>=0.6,<1`、`hachoir>=3.3,<4`、`pydantic>=2.13,<3` 和 `filelock>=3.29.7,<4`，实际版本统一由 `uv.lock` 锁定。它们分别负责 MTProto、加速 AES、视频元数据、严格配置模型和跨平台项目锁。
 - bot 使用 `api_id + api_hash + bot token` 登录，不需要帐号密码、手机号、短信码或用户 session。
 - 项目统一采用 2,000,000,000 bytes 的保守安全阈值；所有上传前后大小判断引用同一个常量。
-- config 使用严格 Pydantic v2 模型；顶层只允许 `bot` 和 `profiles`，每一层都拒绝未知字段和未声明的类型强制转换。
-- source、文件和媒体组条目严格按命令行顺序串行处理，不并发拆分、压缩或 final send；唯一例外是单个文件内部的 MTProto SavePart 流水线。同一项目一次只允许一个 `upload` 实例。
+- config 使用严格 Pydantic v2 模型；顶层允许 `bot`、`profiles` 及可选的 `reupload`，每一层都拒绝未知字段和未声明的类型强制转换。
+- source、文件和媒体组条目严格按命令行顺序串行处理，不并发拆分、压缩或 final send；唯一例外是单个文件内部的 MTProto SavePart 流水线。同一项目的 `upload` 和 `reupload` 共用一个实例锁，整个命令运行期间互斥。
 - 上传前一次性校验全部路径、初始大小和 caption；默认 `error` policy 下任一文件超限时不发送任何文件。
 - 一个未完成 logical send 的应用层重试和受支持的进程重启恢复始终复用已落盘的 MTProto `random_id`。
 - 一条命令完成并清除 pending state 后，再次上传相同文件是新的发布，会得到新的 random ID。

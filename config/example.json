@@ -4,6 +4,12 @@
     "api_id": 123456,
     "api_hash": "REPLACE_WITH_API_HASH"
   },
+  "reupload": {
+    "chat_id": null,
+    "download_dir": null,
+    "keep_downloads": false,
+    "retries": 5
+  },
   "profiles": {
     "default": {
       "chat_id": "-1001234567890",

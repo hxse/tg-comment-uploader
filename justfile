@@ -22,6 +22,10 @@ test:
 upload +paths:
     uv run python -m tg_comment_uploader upload --config "{{config}}" --profile "{{profile}}" --retries "{{retries}}" "$@"
 
+# Listen for forwarded messages, download them, then upload back to the same chat.
+reupload *args:
+    uv run python -m tg_comment_uploader reupload --config "{{config}}" "$@"
+
 upload-profile profile +paths:
     uv run python -m tg_comment_uploader upload --config "{{config}}" --profile "$1" --retries "{{retries}}" "${@:2}"
 

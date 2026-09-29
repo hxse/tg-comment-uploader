@@ -44,7 +44,7 @@ class TerminalProgress:
         self._line_open = False
         self._completed = False
 
-    def update(self, label: str, fraction: float) -> None:
+    def update(self, label: str, fraction: float, *, detail: str | None = None) -> None:
         """Update ``label`` with a completion fraction clamped to ``[0, 1]``."""
 
         normalized_label = _normalize_label(label)
@@ -64,6 +64,8 @@ class TerminalProgress:
         )
         if should_report:
             line = _format_progress_line(normalized_label, normalized_fraction, elapsed)
+            if detail:
+                line = f"{line} {_normalize_label(detail)}"
             if self._is_tty:
                 self._render_tty(line)
             else:
@@ -167,6 +169,18 @@ def _format_duration(seconds: float) -> str:
     if hours:
         return f"{hours:d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:d}:{secs:02d}"
+
+
+def format_bytes(value: float) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    size = float(value)
+    for unit in units:
+        if abs(size) < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{size:.0f} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
 
 
 class TelegramConfirmationWaitIndicator:
@@ -291,6 +305,13 @@ class TelegramConfirmationWaitIndicator:
             self._thread = None
             self._safe_finish_line()
 
+    def log(self, message: str) -> None:
+        """Allow incoming-message logs without interleaving with spinner writes."""
+        with self._write_lock:
+            self._finish_line_unlocked()
+            self._stream.write(f"{message}\n")
+            self._stream.flush()
+
     def _run(self) -> None:
         while True:
             try:
@@ -329,8 +350,11 @@ class TelegramConfirmationWaitIndicator:
 
     def _finish_line(self) -> None:
         with self._write_lock:
-            if self._is_tty and self._line_open:
-                self._stream.write("\n")
-                self._stream.flush()
-            self._rendered_width = 0
-            self._line_open = False
+            self._finish_line_unlocked()
+
+    def _finish_line_unlocked(self) -> None:
+        if self._is_tty and self._line_open:
+            self._stream.write("\n")
+            self._stream.flush()
+        self._rendered_width = 0
+        self._line_open = False

@@ -13,7 +13,9 @@ from pathlib import Path
 from filelock import FileLock, Timeout
 
 UPLOAD_LOCK_RELATIVE_PATH = Path(".local/tg-comment-uploader/upload.lock")
-UPLOAD_LOCK_CONFLICT_MESSAGE = "another tg-comment-uploader upload command is already running"
+UPLOAD_LOCK_CONFLICT_MESSAGE = (
+    "another tg-comment-uploader upload or reupload command is already running"
+)
 
 
 class UploadLockError(RuntimeError):
