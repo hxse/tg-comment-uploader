@@ -77,7 +77,10 @@ def message_kind(message: types.Message) -> Literal["text", "photo", "document"]
         ):
             raise unsupported("stickers and custom-emoji documents are not supported")
         if not 0 < media.document.size <= SAFE_UPLOAD_LIMIT_BYTES:
-            raise unsupported(f"file must be between 1 and {SAFE_UPLOAD_LIMIT_BYTES:,} bytes")
+            raise unsupported(
+                f"file size={media.document.size:,} bytes is outside this project's "
+                f"allowed range of 1..{SAFE_UPLOAD_LIMIT_BYTES:,} bytes"
+            )
         return "document"
     raise unsupported(f"{type(media).__name__} is not supported")
 

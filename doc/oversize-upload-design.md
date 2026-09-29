@@ -42,11 +42,13 @@ just upload --oversize-policy compress '/absolute/path/video.mp4'
 
 ## 统一文件大小阈值
 
-项目采用冻结的全局保守阈值：
+`upload`、`reupload` 和底层发送器共用同一个文件上限：
 
 ```python
-SAFE_UPLOAD_LIMIT_BYTES = 2_000_000_000
+SAFE_UPLOAD_LIMIT_BYTES = 4000 * 512 * 1024  # 2,097,152,000 bytes / 2000 MiB
 ```
+
+此值对应 [官方配置示例](https://core.telegram.org/api/config#upload-max-fileparts-default) 中的 4000 个分片，以及 [MTProto 上传规则](https://core.telegram.org/api/files#uploading-files) 允许的每片 512 KiB。它是项目固定上限，不动态获取账号额度；最终请求仍由 Telegram 服务端校验。
 
 以下位置必须引用同一个常量：
 
@@ -66,7 +68,7 @@ split_target_bytes = floor(SAFE_UPLOAD_LIMIT_BYTES * 0.98)
 compress_target_bytes = floor(SAFE_UPLOAD_LIMIT_BYTES * 0.95)
 ```
 
-即 1,960,000,000 和 1,900,000,000 bytes。target 只用于规划；最终能否发送仍由硬阈值的实际字节数决定。
+即 2,055,208,960 和 1,992,294,400 bytes。target 只用于规划；最终能否发送仍由硬阈值的实际字节数决定。
 
 ## 总体处理流程
 

@@ -19,7 +19,7 @@ Telegram channel comment 本质上是 linked discussion group 中的 reply。pro
 - Telegram transport 固定为 Telethon 1.x MTProto。
 - Python 运行时依赖固定为 `telethon>=1.44,<2`、`cryptg>=0.6,<1`、`hachoir>=3.3,<4`、`pydantic>=2.13,<3` 和 `filelock>=3.29.7,<4`，实际版本统一由 `uv.lock` 锁定。它们分别负责 MTProto、加速 AES、视频元数据、严格配置模型和跨平台项目锁。
 - bot 使用 `api_id + api_hash + bot token` 登录，不需要帐号密码、手机号、短信码或用户 session。
-- 项目统一采用 2,000,000,000 bytes 的保守安全阈值；所有上传前后大小判断引用同一个常量。
+- 项目统一采用 2,097,152,000 bytes（2000 MiB）的文件上限，对应 4000 个 512 KiB MTProto 分片；所有上传前后大小判断引用同一个常量。
 - config 使用严格 Pydantic v2 模型；顶层允许 `bot`、`profiles` 及可选的 `reupload`，每一层都拒绝未知字段和未声明的类型强制转换。
 - source、文件和媒体组条目严格按命令行顺序串行处理，不并发拆分、压缩或 final send；唯一例外是单个文件内部的 MTProto SavePart 流水线。同一项目的 `upload` 和 `reupload` 共用一个实例锁，整个命令运行期间互斥。
 - 上传前一次性校验全部路径、初始大小和 caption；默认 `error` policy 下任一文件超限时不发送任何文件。
@@ -203,8 +203,8 @@ uv run python -m tg_comment_uploader upload \
 
 阈值和媒体行为：
 
-- 硬阈值为 2,000,000,000 bytes。
-- split target 为 1,960,000,000 bytes，compress target 为 1,900,000,000 bytes。
+- 硬阈值为 2,097,152,000 bytes（2000 MiB）。
+- split target 为 2,055,208,960 bytes，compress target 为 1,992,294,400 bytes。
 - `error` 为默认 policy；任一文件超限时在第一个 Telegram 动作前退出。
 - split 继续用 FFmpeg stream copy 和既有关键帧/最少均衡规划。
 - compress 继续用 H.264/AAC、`veryfast` 和 two-pass。

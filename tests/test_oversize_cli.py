@@ -72,10 +72,10 @@ def test_parser_has_one_oversize_policy_and_short_alias() -> None:
     assert "--auto-compress" not in parser.format_help()
 
 
-def test_policy_specific_media_targets_are_unchanged() -> None:
-    assert SAFE_UPLOAD_LIMIT_BYTES == 2_000_000_000
-    assert SPLIT_MEDIA_TARGET_BYTES == 1_960_000_000
-    assert COMPRESS_MEDIA_TARGET_BYTES == 1_900_000_000
+def test_policy_specific_media_targets_follow_the_mtproto_limit() -> None:
+    assert SAFE_UPLOAD_LIMIT_BYTES == 2_097_152_000
+    assert SPLIT_MEDIA_TARGET_BYTES == 2_055_208_960
+    assert COMPRESS_MEDIA_TARGET_BYTES == 1_992_294_400
     assert prepared_media_target_bytes("error") == SPLIT_MEDIA_TARGET_BYTES
     assert prepared_media_target_bytes("split") == SPLIT_MEDIA_TARGET_BYTES
     assert prepared_media_target_bytes("compress") == COMPRESS_MEDIA_TARGET_BYTES

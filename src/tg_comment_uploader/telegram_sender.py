@@ -16,7 +16,9 @@ FinalRequestStatus = Callable[[bool], None]
 PeerResolved = Callable[[int], None]
 BeforeFinalRequest = Callable[[], None]
 
-SAFE_UPLOAD_LIMIT_BYTES = 2_000_000_000
+# MTProto's documented default: 4000 parts at 512 KiB each (2000 MiB).
+# https://core.telegram.org/api/files#uploading-files
+SAFE_UPLOAD_LIMIT_BYTES = 4000 * 512 * 1024
 TELEGRAM_INT32_MAX = 2**31 - 1
 OVERSIZE_POLICY_HINT = (
     "Use --oversize-policy split for lossless splitting, or "
@@ -64,7 +66,7 @@ class UploadItem:
 
 
 def validate_upload_file_size(path: Path, size: int) -> None:
-    """Apply the one conservative Telegram size threshold used everywhere."""
+    """Apply the shared MTProto file size threshold used everywhere."""
 
     if size > SAFE_UPLOAD_LIMIT_BYTES:
         raise NonRetryableUploadError(

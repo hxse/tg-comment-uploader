@@ -788,7 +788,7 @@ def test_sender_enforces_global_safe_size_limit_before_upload(tmp_path: Path) ->
     client = FakeClient()
 
     with make_sender(tmp_path, client=client) as sender:
-        with pytest.raises(NonRetryableUploadError, match="limit=2,000,000,000"):
+        with pytest.raises(NonRetryableUploadError, match="limit=2,097,152,000"):
             sender.send_video(upload_item(path), random_id=1)
 
     assert client.upload_calls == []
