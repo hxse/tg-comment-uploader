@@ -28,6 +28,27 @@ def test_changing_byte_details_does_not_restart_the_shared_timer() -> None:
     assert "elapsed 0:10 eta 0:10 0.5 / 1 MiB" in stream.getvalue()
 
 
+def test_resumed_download_speed_and_eta_exclude_previously_downloaded_bytes(tmp_path: Path) -> None:
+    queue = queue_at(tmp_path)
+    queue.enqueue(forwarded(1, kind="document"))
+    clock = FakeClock()
+    stream = FakeStream(is_tty=True)
+    progress = ReuploadProgress(stream=stream, clock=clock)
+    job = queue.state.jobs[0]
+
+    async def scenario():
+        async with progress.tracking(job):
+            progress.update("downloading", 0, 80 * 1024 * 1024, 100 * 1024 * 1024)
+            clock.now = 10
+            progress.update("downloading", 0, 85 * 1024 * 1024, 100 * 1024 * 1024)
+
+    asyncio.run(scenario())
+    output = stream.getvalue()
+    assert "80.0% elapsed 0:00 eta --:--" in output
+    assert "85.0% elapsed 0:10 eta 0:30" in output
+    assert "512.0 KiB/s" in output
+
+
 def test_confirmation_logs_do_not_interleave_with_spinner_output() -> None:
     stream = FakeStream(is_tty=True)
     wait = TelegramConfirmationWaitIndicator(stream=stream, interval_seconds=60)

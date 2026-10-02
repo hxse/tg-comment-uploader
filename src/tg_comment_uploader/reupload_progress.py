@@ -29,6 +29,7 @@ class ReuploadProgress:
         self._message_ids: tuple[int, ...] = ()
         self._label: str | None = None
         self._done = self._total = 0
+        self._initial_done = 0
         self._started = self._advanced = self._last_render = 0.0
         self._confirming = False
 
@@ -56,6 +57,7 @@ class ReuploadProgress:
             self._label = label
             self._started = self._advanced = now
             self._done = 0
+            self._initial_done = max(done, 0) if stage == "downloading" else 0
         if done > self._done:
             self._advanced = now
         self._done, self._total = max(done, 0), max(total, 1)
@@ -96,14 +98,16 @@ class ReuploadProgress:
             return
         elapsed = max(now - self._started, 0.0)
         idle = max(now - self._advanced, 0.0)
-        rate = self._done / elapsed if elapsed > 0 else 0.0
+        transferred = max(self._done - self._initial_done, 0)
+        rate = transferred / elapsed if elapsed > 0 else 0.0
         if idle >= NO_DATA_NOTICE_SECONDS:
             speed = f"no new data for {int(idle)}s"
         else:
-            speed = f"{format_bytes(rate)}/s" if elapsed > 0 and self._done else "--/s"
+            speed = f"{format_bytes(rate)}/s" if elapsed > 0 and transferred else "--/s"
         self.renderer.update(
             self._label,
             self._done / self._total,
+            initial_fraction=self._initial_done / self._total,
             detail=f"{format_bytes(self._done)} / {format_bytes(self._total)}; {speed}",
         )
         self._last_render = now

@@ -18,6 +18,7 @@ from .reupload_progress import ReuploadProgress
 from .reupload_queue import Job, ReuploadQueue
 
 SETTLE_SECONDS = 2.0
+RECONNECT_STABLE_SECONDS = 60.0
 
 
 class ReuploadService:
@@ -39,6 +40,7 @@ class ReuploadService:
         self.settle_seconds = settle_seconds
         self.intake_error: AppError | None = None
         self.started_at = time.time()
+        self.connected_seconds = 0.0
         self.new_messages_since = new_messages_since
         self.progress = progress if progress is not None else ReuploadProgress()
 
@@ -76,6 +78,7 @@ class ReuploadService:
         self.queue.check_problem()
 
     async def run(self, sender: MtprotoSender) -> None:
+        self.connected_seconds = 0.0
         client, peer = await sender.connect()
         if utils.get_peer_id(peer) != self.queue.state.chat_id:
             raise AppError("resolved Telegram peer does not match reupload.chat_id")
@@ -93,6 +96,7 @@ class ReuploadService:
         for job in self.queue.state.jobs:
             if job.cleanup_pending:
                 self._cleanup(job)
+        connected_at = time.monotonic()
         worker = asyncio.create_task(self.work(sender, client, peer))
         disconnected = asyncio.ensure_future(client.disconnected)
         try:
@@ -112,6 +116,9 @@ class ReuploadService:
                     "Telegram listener disconnected; saved queue will resume"
                 )
         finally:
+            # Freeze uptime before cleanup; disconnect/cleanup delays must not
+            # make a short-lived connection count as a stable recovery.
+            self.connected_seconds = max(time.monotonic() - connected_at, 0.0)
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
             disconnected.cancel()

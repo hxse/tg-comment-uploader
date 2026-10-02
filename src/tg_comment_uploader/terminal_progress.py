@@ -44,7 +44,14 @@ class TerminalProgress:
         self._line_open = False
         self._completed = False
 
-    def update(self, label: str, fraction: float, *, detail: str | None = None) -> None:
+    def update(
+        self,
+        label: str,
+        fraction: float,
+        *,
+        detail: str | None = None,
+        initial_fraction: float = 0.0,
+    ) -> None:
         """Update ``label`` with a completion fraction clamped to ``[0, 1]``."""
 
         normalized_label = _normalize_label(label)
@@ -63,7 +70,9 @@ class TerminalProgress:
             now,
         )
         if should_report:
-            line = _format_progress_line(normalized_label, normalized_fraction, elapsed)
+            line = _format_progress_line(
+                normalized_label, normalized_fraction, elapsed, initial_fraction=initial_fraction
+            )
             if detail:
                 line = f"{line} {_normalize_label(detail)}"
             if self._is_tty:
@@ -145,11 +154,15 @@ def _clamp_fraction(fraction: float) -> float:
     return min(max(value, 0.0), 1.0)
 
 
-def _format_progress_line(label: str, fraction: float, elapsed: float) -> str:
+def _format_progress_line(
+    label: str, fraction: float, elapsed: float, *, initial_fraction: float = 0.0
+) -> str:
     completed_cells = min(int(fraction * BAR_WIDTH), BAR_WIDTH)
     bar = "#" * completed_cells + "-" * (BAR_WIDTH - completed_cells)
     percent = fraction * 100
-    eta = _estimate_eta(fraction, elapsed)
+    initial = min(_clamp_fraction(initial_fraction), fraction)
+    advanced = (fraction - initial) / (1.0 - initial) if initial < 1 else 1.0
+    eta = _estimate_eta(advanced, elapsed)
     eta_text = "--:--" if eta is None else _format_duration(eta)
     return f"{label} [{bar}] {percent:6.1f}% elapsed {_format_duration(elapsed)} eta {eta_text}"
 

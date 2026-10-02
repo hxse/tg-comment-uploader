@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -127,6 +128,9 @@ class FakeBot:
         self.fail_final = 0
         self.fail_download = 0
         self.download_hook: Any = None
+        self.download_chunk_hook: Any = None
+        self.download_offsets: list[tuple[int, int]] = []
+        self.download_streams_closed = 0
         self.thumbnail_payload = THUMBNAIL_JPEG
         self.thumbnail_downloads: list[int] = []
         self.thumbnail_hook: Any = None
@@ -183,6 +187,39 @@ class FakeBot:
 
     async def catch_up(self) -> None:
         pass
+
+    @asynccontextmanager
+    async def iter_download(
+        self, message: types.Message, *, offset=0, request_size=512 * 1024, file_size=None
+    ):
+        async def chunks():
+            self.timeline.append(("download", message.id))
+            self.download_offsets.append((message.id, offset))
+            start = offset
+            first = self.payload[start : start + 4]
+            if first:
+                yield first
+                start += len(first)
+                if self.download_chunk_hook:
+                    await self.download_chunk_hook(message, start)
+            if self.download_hook:
+                await self.download_hook(message)
+            if self.fail_download:
+                self.fail_download -= 1
+                raise ConnectionError("simulated download interruption")
+            while start < len(self.payload):
+                chunk = self.payload[start : start + request_size]
+                yield chunk
+                start += len(chunk)
+                if self.download_chunk_hook:
+                    await self.download_chunk_hook(message, start)
+
+        stream = chunks()
+        try:
+            yield stream
+        finally:
+            await stream.aclose()
+            self.download_streams_closed += 1
 
     async def disconnect(self) -> None:
         self.connected = False

@@ -17,7 +17,7 @@ from .reupload_maintenance import delete_downloads, discard_pending
 from .reupload_paths import resolve_download_root
 from .reupload_queue import ReuploadQueue
 from .reupload_relocate import relocate_downloads
-from .reupload_service import ReuploadService
+from .reupload_service import RECONNECT_STABLE_SECONDS, ReuploadService
 from .upload_state import get_mtproto_paths
 
 
@@ -131,7 +131,8 @@ def run_reupload_locked(args: argparse.Namespace) -> int:
         deferred = queue.defer_pending()
         print(f"resume disabled: {deferred} existing pending task(s) retained; new forwards only")
     queue.check_problem()
-    for attempt in range(1, options.retries + 2):
+    failures = 0
+    while True:
         service = ReuploadService(
             queue,
             bot_id=paths.owner.bot_id,
@@ -154,11 +155,16 @@ def run_reupload_locked(args: argparse.Namespace) -> int:
                 sender.run_service(service.run(sender))
             return 0
         except RetryableUploadError as exc:
-            if attempt > options.retries:
+            if service.connected_seconds >= RECONNECT_STABLE_SECONDS:
+                if failures:
+                    print("listener recovered and stayed stable; reconnect retry count reset")
+                failures = 0
+            failures += 1
+            if failures > options.retries:
                 raise AppError(
-                    f"listener failed after {attempt} attempts; rerun just reupload to resume: {exc}"
+                    f"listener failed after {failures} consecutive attempts; "
+                    f"rerun just reupload to resume: {exc}"
                 ) from exc
-            delay = retry_delay_seconds(exc, failed_attempt=attempt)
+            delay = retry_delay_seconds(exc, failed_attempt=failures)
             print(f"reconnecting in {delay}s; queue and random IDs retained: {exc}", flush=True)
             time.sleep(delay)
-    return 1
