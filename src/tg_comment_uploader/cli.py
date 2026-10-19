@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
+from .config import DEFAULT_CONFIG
 from .config import (
     AppConfig as AppConfig,
 )
@@ -67,7 +68,6 @@ SPLIT_MEDIA_TARGET_BYTES = SAFE_UPLOAD_LIMIT_BYTES * 98 // 100
 COMPRESS_MEDIA_TARGET_BYTES = SAFE_UPLOAD_LIMIT_BYTES * 95 // 100
 
 UploadResultT = TypeVar("UploadResultT")
-DEFAULT_CONFIG = Path("config/config.json")
 
 
 def main(argv: list[str] | None = None) -> int:

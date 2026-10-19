@@ -1,7 +1,7 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 set positional-arguments
 
-config := "config/config.json"
+config := "config.toml"
 profile := "default"
 retries := "5"
 

@@ -66,8 +66,8 @@ def store(tmp_path: Path, *, owner: PendingOwner | None = None) -> PendingUpload
 
 def test_paths_are_project_local_private_names_and_isolate_credentials(tmp_path: Path) -> None:
     (tmp_path / "justfile").write_text("", encoding="utf-8")
-    config = tmp_path / "private config.json"
-    config.write_text("{}", encoding="utf-8")
+    config = tmp_path / "private config.toml"
+    config.touch()
 
     first = get_mtproto_paths(
         config,
@@ -83,8 +83,8 @@ def test_paths_are_project_local_private_names_and_isolate_credentials(tmp_path:
         api_hash="HASH_ONE",
         project_root=tmp_path,
     )
-    other_config = tmp_path / "other config.json"
-    other_config.write_text("{}", encoding="utf-8")
+    other_config = tmp_path / "other config.toml"
+    other_config.touch()
     third = get_mtproto_paths(
         other_config,
         "123456:SECRET_ONE",
@@ -105,6 +105,43 @@ def test_paths_are_project_local_private_names_and_isolate_credentials(tmp_path:
     assert "SECRET" not in rendered
     assert "HASH_ONE" not in rendered
     assert "private config" not in rendered
+
+
+def test_root_toml_preserves_legacy_session_and_pending_upload_after_move(tmp_path: Path) -> None:
+    legacy = tmp_path / "config/config.json"
+    legacy.parent.mkdir()
+    legacy.touch()
+    old_paths = get_mtproto_paths(
+        legacy, "123456:TEST", api_id=123, api_hash="hash", project_root=tmp_path
+    )
+    state = PendingUploadStore(old_paths.pending_path, owner=old_paths.owner)
+    pending = state.open_or_create(intent(tmp_path))
+    unit = state.register_unit(spec(tmp_path))
+    state.bind_peer(-1001234567890)
+    state.mark_sending(unit.key)
+    old_state = state.path.read_bytes()
+
+    migrated = tmp_path / "config.toml"
+    legacy.rename(migrated)
+    new_paths = get_mtproto_paths(
+        migrated, "123456:TEST", api_id=123, api_hash="hash", project_root=tmp_path
+    )
+    assert new_paths == old_paths
+    restored = PendingUploadStore(new_paths.pending_path, owner=new_paths.owner).inspect()
+    assert restored is not None
+    assert restored.operation_id == pending.operation_id
+    assert restored.units[0].random_ids == unit.random_ids
+    assert restored.units[0].status == "sending"
+    assert state.path.read_bytes() == old_state
+
+    custom = tmp_path / "other/config.toml"
+    custom.parent.mkdir()
+    custom.touch()
+    custom_paths = get_mtproto_paths(
+        custom, "123456:TEST", api_id=123, api_hash="hash", project_root=tmp_path
+    )
+    assert custom_paths.owner != old_paths.owner
+    assert custom_paths.session_path != old_paths.session_path
 
 
 def test_create_register_is_durable_idempotent_and_private(tmp_path: Path) -> None:
@@ -605,8 +642,8 @@ def test_failed_atomic_replace_preserves_previous_checkpoint_and_cleans_temp(
 
 def test_state_json_contains_no_credentials_or_plain_config_path(tmp_path: Path) -> None:
     (tmp_path / "justfile").write_text("", encoding="utf-8")
-    config = tmp_path / "do-not-persist-this-config-name.json"
-    config.write_text("{}", encoding="utf-8")
+    config = tmp_path / "do-not-persist-this-config-name.toml"
+    config.touch()
     paths = get_mtproto_paths(
         config,
         "123456:DO_NOT_PERSIST_THIS_TOKEN",

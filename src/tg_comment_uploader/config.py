@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import os
+import re
+import tomllib
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .errors import AppError, NonRetryableUploadError
 from .mtproto_protocol import normalize_chat_id
-from .strict_json import StrictJsonError, loads_strict_json
 from .telegram_sender import TELEGRAM_INT32_MAX, parse_bot_id
+
+DEFAULT_CONFIG = Path("config.toml")
 
 
 class StrictConfigModel(BaseModel):
@@ -132,9 +135,15 @@ def load_config(path: Path) -> AppConfig:
         raise AppError(f"failed to read config file {path}: {exc}") from exc
 
     try:
-        raw = loads_strict_json(config_text)
-    except StrictJsonError as exc:
-        raise AppError(f"invalid JSON in {path}: {exc}") from exc
+        raw = tomllib.loads(config_text)
+    except tomllib.TOMLDecodeError as exc:
+        # Parser messages can include user-supplied keys; expose only the
+        # location so a malformed credential cannot be echoed in an error.
+        location = re.search(r"\(at (?:line \d+, column \d+|end of document)\)$", str(exc))
+        suffix = f" {location[0]}" if location else ""
+        raise AppError(
+            f"invalid TOML in {path}{suffix}: check syntax and duplicate keys or tables"
+        ) from exc
 
     try:
         return AppConfig.model_validate(raw)

@@ -1,0 +1,23 @@
+[bot]
+token = "123456789:REPLACE_WITH_BOT_TOKEN"
+api_id = 123456
+api_hash = "REPLACE_WITH_API_HASH"
+
+[reupload]
+# Set chat_id before running reupload. Omit download_dir to use system Downloads.
+# chat_id = "-1001234567890"
+# download_dir = "~/Downloads/tg-comment-uploader/reupload"
+keep_downloads = false
+retries = 5
+
+[profiles.default]
+chat_id = "-1001234567890"
+reply_message_id = 12345
+caption = "{stem}"
+supports_streaming = true
+
+[profiles.direct]
+chat_id = "-1009876543210"
+# Omit reply_message_id for direct uploads; use caption = "" for no caption.
+caption = "{stem}"
+supports_streaming = true

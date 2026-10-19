@@ -8,7 +8,7 @@
 
 另有独立的 `just reupload`：监听指定频道或 Bot 私聊中的转发，下载后重新上传到同一会话。配置、支持范围和恢复方式详见 [转发备份设计与使用](reupload-design.md)。以下上传流程主要描述 `just upload`。
 
-Telegram channel comment 本质上是 linked discussion group 中的 reply。profile 配置 `reply_message_id` 时，工具向 `chat_id` 发送视频，并用 MTProto `InputReplyToMessage` 回复指定消息；省略或设为 `null` 时，视频作为 `chat_id` 中的独立消息发布。
+Telegram channel comment 本质上是 linked discussion group 中的 reply。profile 配置 `reply_message_id` 时，工具向 `chat_id` 发送视频，并用 MTProto `InputReplyToMessage` 回复指定消息；省略时，视频作为 `chat_id` 中的独立消息发布。
 
 普通视频和压缩结果发送为单视频；拆分结果按 2–10 项组成相册，超过 10 项时继续使用项目既有的最少且均衡分组。
 
@@ -45,11 +45,11 @@ just dev-shell
 复制示例配置：
 
 ```sh
-cp config/example.json config/config.json
-chmod 600 config/config.json
+cp config.example.toml config.toml
+chmod 600 config.toml
 ```
 
-编辑 `config/config.json`，填入 bot token、API ID/hash、目标 chat ID 和可选 reply message ID。首次上传会在本地创建 Telethon bot session；这个过程不应询问手机号或验证码。后续命令复用与 config、bot 和凭据绑定的 session。
+编辑根目录的 `config.toml`，填入 bot token、API ID/hash、目标 chat ID 和可选 reply message ID。首次上传会在本地创建 Telethon bot session；这个过程不应询问手机号或验证码。后续命令复用与 config、bot 和凭据绑定的 session。
 
 上传文件：
 
@@ -84,8 +84,8 @@ just retries=8 upload '/absolute/path/to/videos/video-001.mp4'
 使用其他 config：
 
 ```sh
-just upload-config config/other.json '/absolute/path/video.mp4'
-just upload-config-retry config/other.json 8 '/absolute/path/video.mp4'
+just upload-config /private/other.toml '/absolute/path/video.mp4'
+just upload-config-retry /private/other.toml 8 '/absolute/path/video.mp4'
 ```
 
 ## Config
@@ -93,34 +93,36 @@ just upload-config-retry config/other.json 8 '/absolute/path/video.mp4'
 真实业务配置默认位于：
 
 ```text
-config/config.json
+config.toml
 ```
 
-`.gitignore` 忽略 `config/` 下除 `config/example.json` 外的文件、备份和子目录。忽略规则不能阻止 `git add -f`，提交前仍需检查暂存内容中是否出现 bot token、api hash、session 或其他私密数据。
+根目录的 `config.example.toml` 是可提交的示例。`.gitignore` 忽略真实配置 `config.toml`、其 `config.toml.*` 备份，以及旧 `config/` 目录。自定义路径的配置需自行保证不会提交。忽略规则不能阻止 `git add -f`，提交前仍需检查暂存内容中是否出现 bot token、api hash、session 或其他私密数据。
 
 示例结构：
 
-```json
-{
-  "bot": {
-    "token": "123456789:REPLACE_WITH_BOT_TOKEN",
-    "api_id": 123456,
-    "api_hash": "REPLACE_WITH_API_HASH"
-  },
-  "profiles": {
-    "default": {
-      "chat_id": "-1001234567890",
-      "reply_message_id": 12345,
-      "caption": "{stem}",
-      "supports_streaming": true
-    },
-    "direct": {
-      "chat_id": "-1009876543210",
-      "caption": "{stem}",
-      "supports_streaming": true
-    }
-  }
-}
+```toml
+[bot]
+token = "123456789:REPLACE_WITH_BOT_TOKEN"
+api_id = 123456
+api_hash = "REPLACE_WITH_API_HASH"
+
+[reupload]
+# 启动 reupload 前填入接收转发消息的会话 ID。
+# chat_id = "-1001234567890"
+# download_dir = "~/Downloads/tg-comment-uploader/reupload"
+keep_downloads = false
+retries = 5
+
+[profiles.default]
+chat_id = "-1001234567890"
+reply_message_id = 12345
+caption = "{stem}"
+supports_streaming = true
+
+[profiles.direct]
+chat_id = "-1009876543210"
+caption = "{stem}"
+supports_streaming = true
 ```
 
 字段说明：
@@ -129,11 +131,13 @@ config/config.json
 - `bot.api_id`：从 `my.telegram.org` 获取的正整数 API ID。
 - `bot.api_hash`：对应 API hash。
 - `profiles.<name>.chat_id`：目标频道、群组或 discussion group 的十进制 ID、Telegram username 或邀请链接。纯十进制字符串会在 MTProto 边界先转换为整数，避免 `-100...` 被当成电话号码；不支持可能命中 session 缓存中歧义对象的显示名，也不支持电话号码。
-- `profiles.<name>.reply_message_id`：可选正整数。存在时回复该消息；省略或 `null` 时 direct。
-- `profiles.<name>.caption`：默认 `{stem}`，`null` 表示空 caption。只允许 `{name}`、`{stem}`、`{suffix}`、`{parent}`、`{path}`；禁止属性、下标、conversion 和 format spec。
+- `profiles.<name>.reply_message_id`：可选正整数。存在时回复该消息；省略时 direct。
+- `profiles.<name>.caption`：默认 `{stem}`，`""` 表示空 caption。只允许 `{name}`、`{stem}`、`{suffix}`、`{parent}`、`{path}`；禁止属性、下标、conversion 和 format spec。
 - `profiles.<name>.supports_streaming`：默认 `true`；显式 `false` 会传到每个视频属性。
 
-配置 JSON 在解析阶段递归拒绝重复字段；配置模型在顶层、`bot` 和每个 profile 上统一使用 `strict=True`、`extra="forbid"`、`frozen=True` 和 `hide_input_in_errors=True`。字段拼写错误和其他未知字段均在任何 pending 或网络动作前报错；错误信息不包含 token、API hash 等原始输入值。只有 schema 明确声明的业务规范化例外：整数 `chat_id` 转成稳定十进制字符串，`caption: null` 转成空字符串。`api_id` 和 `reply_message_id` 均限制为 Telegram 可序列化的正 signed 32-bit 范围。
+配置使用 Python 标准库 `tomllib` 读取，在解析阶段拒绝重复字段和重复表；配置模型在顶层、`bot`、`reupload` 和每个 profile 上统一使用 `strict=True`、`extra="forbid"`、`frozen=True` 和 `hide_input_in_errors=True`。字段拼写错误和其他未知字段均在任何 pending 或网络动作前报错；错误信息不包含 token、API hash 等原始输入值。整数 `chat_id` 会转成稳定十进制字符串。`api_id` 和 `reply_message_id` 均限制为 Telegram 可序列化的正 signed 32-bit 范围。
+
+旧 JSON 配置需转换为 TOML，不能只改扩展名。TOML 没有 `null`：原本为空的 `reply_message_id`、`reupload.chat_id`、`download_dir` 或整个 `reupload` 字段应省略，原本为 `null` 的 caption 改为 `caption = ""`。根目录 `config.toml` 沿用旧默认 `config/config.json` 的内部状态标识，因此相同 Bot 和配置迁移后仍复用原会话、pending 和 reupload 队列；删除旧配置文件不会改变标识。自定义配置路径仍各自隔离。
 
 POSIX 系统上每次读取真实 config 时收紧为 `0600`。
 
@@ -155,7 +159,7 @@ just check
 just test
 ```
 
-默认 config、profile 和 retries 分别是 `config/config.json`、`default`、`5`。现有参数顺序和含空格路径转发保持不变。
+默认 config、profile 和 retries 分别是 `config.toml`、`default`、`5`。现有参数顺序和含空格路径转发保持不变。
 
 静态检查：
 
@@ -179,7 +183,7 @@ uv run pytest
 
 ```sh
 uv run python -m tg_comment_uploader upload \
-  --config config/config.json \
+  --config config.toml \
   --profile default \
   --retries 5 \
   --oversize-policy error \
@@ -260,7 +264,7 @@ session 位于：
 <project-root>/.local/tg-comment-uploader/mtproto/pending-upload-v1.json
 ```
 
-它保存 command intent、文件/产物 expected size/hash、group 边界、random IDs、`planned/sending/confirmed`、message IDs、source-completed 列表和 command-level `completion_ready`，不保存视频、token、api hash 或 session auth key。JSON 读取与配置共用递归拒绝重复字段的严格 loader，随后再校验精确 schema 与状态机不变量。coordinator 先计算并写入 expected 值，sender 再对实际上传的同一 fd 校验，避免路径预检与 reopen 之间的 TOCTOU。更新使用同目录临时文件、fsync 和 atomic replace；POSIX 权限为 `0600`。
+它保存 command intent、文件/产物 expected size/hash、group 边界、random IDs、`planned/sending/confirmed`、message IDs、source-completed 列表和 command-level `completion_ready`，不保存视频、token、api hash 或 session auth key。状态文件仍使用递归拒绝重复字段的严格 JSON loader，随后再校验精确 schema 与状态机不变量。coordinator 先计算并写入 expected 值，sender 再对实际上传的同一 fd 校验，避免路径预检与 reopen 之间的 TOCTOU。更新使用同目录临时文件、fsync 和 atomic replace；POSIX 权限为 `0600`。
 
 pending JSON schema 保持 v1；媒体处理身份是独立版本，当前 `media_algorithm_version` 为 `2`，表示 FFmpeg 前的 verified snapshot 以及 `input/`、`output/` 布局。旧算法 v1 的全 `planned` checkpoint 会由现有安全替换规则原子淘汰；v1 的 `sending` 或部分 confirmed checkpoint 仍阻止新命令，不能因版本升级自动丢弃。
 
@@ -283,7 +287,7 @@ pending JSON schema 保持 v1；媒体处理身份是独立版本，当前 `medi
 
 ```sh
 uv run python -m tg_comment_uploader pending-status \
-  --config config/config.json
+  --config config.toml
 ```
 
 无 state 时输出 `pending upload: <none>`。有 state 时先按完整 schema 和状态机严格读取，即使 owner 不属于当前 config/bot 也允许只读查看；输出额外标记 `owner: current|foreign`，并只显示 schema、operation ID、阶段、unit 数和 confirmed 数，不显示 owner 指纹、bot ID、caption、绝对路径、完整 hash 或凭据。阶段严格区分 `planned`、`sending`、`partially-confirmed` 和 `confirmed`；只要已经确认过任何消息，就不会显示成 `planned`。
@@ -292,7 +296,7 @@ uv run python -m tg_comment_uploader pending-status \
 
 ```sh
 uv run python -m tg_comment_uploader pending-discard \
-  --config config/config.json \
+  --config config.toml \
   --operation-id <full-operation-id>
 ```
 
@@ -300,7 +304,7 @@ uv run python -m tg_comment_uploader pending-discard \
 
 ```sh
 uv run python -m tg_comment_uploader pending-discard \
-  --config config/config.json \
+  --config config.toml \
   --operation-id <full-operation-id> \
   --force-foreign-owner
 ```
@@ -321,7 +325,7 @@ force 只放宽 owner 匹配，不绕过严格 state 校验、完整 operation I
 
 ## 安全边界
 
-- `config/` 除示例外由 Git 忽略；`.local/` 覆盖 lock、session 和 pending state。提交前仍检查 staged diff。
+- `config.toml`、`config.toml.*` 及旧 `config/` 目录由 Git 忽略；`.local/` 覆盖 lock、session 和 pending state。提交前仍检查 staged diff。
 - config 为 `0600`；MTProto session/state 目录为 `0700`，文件为 `0600`。
 - bot token、api hash 和 session auth key 泄漏都可能导致 bot 或 API 凭据被滥用。
 - 凭据只传给当前 Python 进程中的 Telethon，不进入 argv、子进程环境或交互 shell。

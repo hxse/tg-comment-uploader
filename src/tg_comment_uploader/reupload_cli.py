@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from datetime import UTC, datetime
 
-from .config import load_config
+from .config import DEFAULT_CONFIG, load_config
 from .errors import AppError, RetryableUploadError
 from .locking import UploadLockError, find_project_root, upload_instance_lock
 from .mtproto_sender import MtprotoSender
@@ -25,7 +25,7 @@ def add_reupload_parser(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser(
         "reupload", help="download forwards and upload back to the same chat"
     )
-    parser.add_argument("--config", type=Path, default=Path("config/config.json"))
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument(
         "--download-dir",
         type=Path,

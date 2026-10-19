@@ -248,6 +248,12 @@ def get_mtproto_paths(
         bot_id = parse_bot_id(bot_token)
     except ValueError as exc:
         raise AppError(f"config.bot.token {exc}") from exc
+    root = find_project_root() if project_root is None else project_root.resolve()
+    if resolved_config == root / "config.toml":
+        # Keep the default config's identity across the JSON-to-TOML migration.
+        # Sessions, pending sends and reupload queues must retain their owners
+        # even after the old file is removed. Custom config paths stay isolated.
+        resolved_config = root / "config/config.json"
     config_fingerprint = _fingerprint("config-path", str(resolved_config))
     credential_fingerprint = _fingerprint(
         "telegram-credentials",
@@ -255,7 +261,6 @@ def get_mtproto_paths(
         api_hash,
         bot_token,
     )
-    root = find_project_root() if project_root is None else project_root.resolve()
     sessions_dir = root / SESSION_DIRECTORY_RELATIVE_PATH
     session_name = f"{config_fingerprint[:32]}-bot{bot_id}-{credential_fingerprint[:32]}.session"
     return MtprotoPaths(

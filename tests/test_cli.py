@@ -47,20 +47,24 @@ from tg_comment_uploader.upload_contract import OversizePolicy
 def write_config(path: Path) -> None:
     path.write_text(
         """
-{
-  "bot": {"token": "123456:TEST_TOKEN", "api_id": 123, "api_hash": "hash"},
-  "profiles": {
-    "default": {
-      "chat_id": "-1001234567890",
-      "reply_message_id": 42,
-      "caption": "{stem}",
-      "supports_streaming": false
-    },
-    "direct": {"chat_id": "@private_test", "caption": null},
-    "direct-null": {"chat_id": "-1002", "reply_message_id": null}
-  }
-"""
-        + "\n}\n",
+[bot]
+token = "123456:TEST_TOKEN"
+api_id = 123
+api_hash = "hash"
+
+[profiles.default]
+chat_id = "-1001234567890"
+reply_message_id = 42
+caption = "{stem}"
+supports_streaming = false
+
+[profiles.direct]
+chat_id = "@private_test"
+caption = ""
+
+[profiles.defaults]
+chat_id = "-1002"
+""",
         encoding="utf-8",
     )
 
@@ -83,7 +87,7 @@ def fake_config(profile: ProfileConfig | None = None) -> AppConfig:
 
 
 def test_load_config_accepts_only_the_final_schema(tmp_path: Path) -> None:
-    config_path = tmp_path / "config.json"
+    config_path = tmp_path / "config.toml"
     write_config(config_path)
 
     config = load_config(config_path)
@@ -93,49 +97,47 @@ def test_load_config_accepts_only_the_final_schema(tmp_path: Path) -> None:
     assert config.profiles["default"].supports_streaming is False
     assert config.profiles["direct"].caption == ""
     assert config.profiles["direct"].reply_message_id is None
-    assert config.profiles["direct-null"].reply_message_id is None
+    assert config.profiles["defaults"].reply_message_id is None
+    assert config.profiles["defaults"].caption == "{stem}"
+    assert config.profiles["defaults"].supports_streaming is True
     if os.name == "posix":
         assert config_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_load_config_rejects_unknown_fields_at_every_schema_layer(tmp_path: Path) -> None:
-    config_path = tmp_path / "config.json"
+    config_path = tmp_path / "config.toml"
     private_value = "PRIVATE_UNKNOWN_VALUE"
     for payload, extra_key in (
         (
-            {
-                "bot": {"token": "1:x", "api_id": 1, "api_hash": "h"},
-                "profiles": {"default": {"chat_id": "-1001"}},
-                "unknown_top_level": private_value,
-            },
+            """
+unknown_top_level = "PRIVATE_UNKNOWN_VALUE"
+bot = {token = "1:x", api_id = 1, api_hash = "h"}
+profiles = {default = {chat_id = "-1001"}}
+""",
             "unknown_top_level",
         ),
         (
-            {
-                "bot": {
-                    "token": "1:x",
-                    "api_id": 1,
-                    "api_hash": "h",
-                    "unknown_bot_field": private_value,
-                },
-                "profiles": {"default": {"chat_id": "-1001"}},
-            },
+            """
+profiles = {default = {chat_id = "-1001"}}
+[bot]
+token = "1:x"
+api_id = 1
+api_hash = "h"
+unknown_bot_field = "PRIVATE_UNKNOWN_VALUE"
+""",
             "unknown_bot_field",
         ),
         (
-            {
-                "bot": {"token": "1:x", "api_id": 1, "api_hash": "h"},
-                "profiles": {
-                    "default": {
-                        "chat_id": "-1001",
-                        "unknown_profile_field": private_value,
-                    }
-                },
-            },
+            """
+bot = {token = "1:x", api_id = 1, api_hash = "h"}
+[profiles.default]
+chat_id = "-1001"
+unknown_profile_field = "PRIVATE_UNKNOWN_VALUE"
+""",
             "unknown_profile_field",
         ),
     ):
-        config_path.write_text(json.dumps(payload), encoding="utf-8")
+        config_path.write_text(payload, encoding="utf-8")
         with pytest.raises(
             AppError,
             match=rf"(?s){extra_key}.*Extra inputs are not permitted",
@@ -156,26 +158,58 @@ def test_config_models_are_strict_frozen_and_hide_inputs() -> None:
         setattr(bot, "api_hash", "changed")
 
 
-def test_config_rejects_duplicate_json_fields_recursively(tmp_path: Path) -> None:
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "bot = {}\nbot = {}",
+        '[bot]\ntoken = "1:x"\ntoken = "2:y"',
         """
-{
-  "bot": {"token": "1:x", "api_id": 1, "api_hash": "h"},
-  "profiles": {
-    "default": {
-      "chat_id": "-1001",
-      "reply_message_id": 42,
-      "reply_message_id": null
-    }
-  }
-}
+bot = {token = "1:x", api_id = 1, api_hash = "h"}
+[profiles.default]
+chat_id = "-1001"
+reply_message_id = 42
+reply_message_id = 43
 """,
-        encoding="utf-8",
-    )
+        '[profiles.default]\nchat_id = "-1001"\n[profiles.default]',
+        'profiles = {default = {chat_id = "-1001", chat_id = "-1002"}}',
+    ],
+)
+def test_config_rejects_duplicate_toml_keys_and_tables(tmp_path: Path, payload: str) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(payload, encoding="utf-8")
 
-    with pytest.raises(AppError, match="duplicate JSON object key 'reply_message_id'"):
+    with pytest.raises(AppError, match="invalid TOML.*duplicate keys or tables"):
         load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "token = PRIVATE_CREDENTIAL_VALUE",
+        '["PRIVATE_CREDENTIAL_VALUE"]\n["PRIVATE_CREDENTIAL_VALUE"]',
+        "caption = null # PRIVATE_CREDENTIAL_VALUE",
+    ],
+)
+def test_invalid_toml_does_not_echo_credentials(tmp_path: Path, payload: str) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(payload, encoding="utf-8")
+    with pytest.raises(AppError, match="invalid TOML") as caught:
+        load_config(config_path)
+    assert "PRIVATE_CREDENTIAL_VALUE" not in str(caught.value)
+
+
+def test_example_toml_loads_with_optional_reupload_fields_unset(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    example_path = Path(__file__).resolve().parents[1] / "config.example.toml"
+    config_path.write_bytes(example_path.read_bytes())
+    config = load_config(config_path)
+
+    assert set(config.profiles) == {"default", "direct"}
+    assert config.profiles["default"].reply_message_id == 12345
+    assert config.profiles["direct"].reply_message_id is None
+    assert config.reupload is not None
+    assert config.reupload.chat_id is None
+    assert config.reupload.download_dir is None
 
 
 def test_config_enforces_telegram_signed_int32_bounds() -> None:
@@ -190,16 +224,14 @@ def test_config_enforces_telegram_signed_int32_bounds() -> None:
 
 
 def test_load_config_accepts_string_and_integer_chat_ids(tmp_path: Path) -> None:
-    config_path = tmp_path / "config.json"
+    config_path = tmp_path / "config.toml"
     config_path.write_text(
         """
-{
-  "bot": {"token": "1:x", "api_id": 1, "api_hash": "h"},
-  "profiles": {
-    "string": {"chat_id": "-1001"},
-    "integer": {"chat_id": -1002}
-  }
-}
+bot = {token = "1:x", api_id = 1, api_hash = "h"}
+[profiles.string]
+chat_id = "-1001"
+[profiles.integer]
+chat_id = -1002
 """,
         encoding="utf-8",
     )
@@ -211,19 +243,17 @@ def test_load_config_accepts_string_and_integer_chat_ids(tmp_path: Path) -> None
 
 
 def test_load_config_validation_does_not_echo_credentials(tmp_path: Path) -> None:
-    config_path = tmp_path / "config.json"
+    config_path = tmp_path / "config.toml"
     token_value = 987_654_321_987
     api_hash_value = "PRIVATE_API_HASH_VALUE"
     config_path.write_text(
         """
-{
-  "bot": {
-    "token": 987654321987,
-    "api_id": 1,
-    "api_hash": ["PRIVATE_API_HASH_VALUE"]
-  },
-  "profiles": {"default": {"chat_id": "-1001"}}
-}
+[bot]
+token = 987654321987
+api_id = 1
+api_hash = ["PRIVATE_API_HASH_VALUE"]
+[profiles.default]
+chat_id = "-1001"
 """,
         encoding="utf-8",
     )
@@ -239,18 +269,16 @@ def test_load_config_validation_does_not_echo_credentials(tmp_path: Path) -> Non
 
 
 def test_load_config_rejects_malformed_token_without_echoing_it(tmp_path: Path) -> None:
-    config_path = tmp_path / "config.json"
+    config_path = tmp_path / "config.toml"
     malformed_token = "PRIVATE_MALFORMED_TOKEN_VALUE"
     config_path.write_text(
         """
-{
-  "bot": {
-    "token": "PRIVATE_MALFORMED_TOKEN_VALUE",
-    "api_id": 1,
-    "api_hash": "h"
-  },
-  "profiles": {"default": {"chat_id": "-1001"}}
-}
+[bot]
+token = "PRIVATE_MALFORMED_TOKEN_VALUE"
+api_id = 1
+api_hash = "h"
+[profiles.default]
+chat_id = "-1001"
 """,
         encoding="utf-8",
     )
@@ -269,13 +297,13 @@ def test_load_config_rejects_non_positive_integer_reply_id(
     tmp_path: Path,
     invalid: object,
 ) -> None:
-    config_path = tmp_path / "config.json"
+    config_path = tmp_path / "config.toml"
     config_path.write_text(
         """
-{
-  "bot": {"token": "1:x", "api_id": 1, "api_hash": "h"},
-  "profiles": {"invalid": {"chat_id": "-1001", "reply_message_id": %s}}
-}
+bot = {token = "1:x", api_id = 1, api_hash = "h"}
+[profiles.invalid]
+chat_id = "-1001"
+reply_message_id = %s
 """
         % json.dumps(invalid),
         encoding="utf-8",
@@ -290,15 +318,14 @@ def test_load_config_rejects_non_positive_integer_api_id(
     tmp_path: Path,
     invalid: object,
 ) -> None:
-    config_path = tmp_path / "config.json"
+    config_path = tmp_path / "config.toml"
     config_path.write_text(
         """
-{
-  "bot": {"token": "1:x", "api_id": %s, "api_hash": "h"},
-  "profiles": {"default": {"chat_id": "-1001"}}
-}
+bot = {token = "1:x", api_id = %s, api_hash = "h"}
+[profiles.default]
+chat_id = "-1001"
 """
-        % __import__("json").dumps(invalid),
+        % json.dumps(invalid),
         encoding="utf-8",
     )
 
@@ -323,15 +350,14 @@ def test_load_config_rejects_locally_invalid_chat_id(
     tmp_path: Path,
     invalid: str,
 ) -> None:
-    config_path = tmp_path / "config.json"
+    config_path = tmp_path / "config.toml"
     config_path.write_text(
         """
-{
-  "bot": {"token": "1:x", "api_id": 1, "api_hash": "h"},
-  "profiles": {"default": {"chat_id": %s}}
-}
+bot = {token = "1:x", api_id = 1, api_hash = "h"}
+[profiles.default]
+chat_id = %s
 """
-        % __import__("json").dumps(invalid),
+        % json.dumps(invalid),
         encoding="utf-8",
     )
 
@@ -347,9 +373,11 @@ def test_parser_keeps_current_upload_and_pending_command_contract() -> None:
     assert args.retries == DEFAULT_RETRIES == 5
     assert args.oversize_policy == "split"
     assert args.paths == ["/videos/a.mp4"]
-    assert parser.parse_args(["pending-status"]).config == Path("config/config.json")
+    assert args.config == Path("config.toml")
+    assert parser.parse_args(["pending-status"]).config == Path("config.toml")
     discard = parser.parse_args(["pending-discard", "--operation-id", "abc"])
     assert discard.operation_id == "abc"
+    assert discard.config == Path("config.toml")
     assert discard.force_foreign_owner is False
     forced = parser.parse_args(
         ["pending-discard", "--operation-id", "abc", "--force-foreign-owner"]

@@ -14,31 +14,28 @@
 
 ## 配置
 
-保留现有顶层 `bot`、`profiles`，新增可选的 `reupload`：
+根目录的 `config.toml` 包含 `bot`、`profiles`，以及可选的 `reupload` 表：
 
-```json
-{
-  "reupload": {
-    "chat_id": null,
-    "download_dir": null,
-    "keep_downloads": false,
-    "retries": 5
-  }
-}
+```toml
+[reupload]
+# chat_id = "-1001234567890"
+# download_dir = "~/Downloads/tg-comment-uploader/reupload"
+keep_downloads = false
+retries = 5
 ```
 
-`chat_id` 填接收及返回备份消息的同一个会话 ID，例如 `-100...`；私聊时填写已主动联系过 Bot 的用户 ID。`chat_id: null` 只用于尚未配置的模板，启动 `reupload` 时必须补齐。
+`chat_id` 填接收及返回备份消息的同一个会话 ID，例如 `-100...`；私聊时填写已主动联系过 Bot 的用户 ID。示例中注释掉该字段，启动 `reupload` 前必须取消注释并填入实际 ID。
 
-`download_dir` 省略或设为 `null` 时，使用系统下载目录下的 `tg-comment-uploader/reupload/`。Linux 读取 XDG 的 `user-dirs.dirs` 中的 `XDG_DOWNLOAD_DIR`，支持本地化目录和 `XDG_CONFIG_HOME`；未配置时使用 `~/Downloads`。也可填入自定义路径。相对路径相对项目根目录，支持 `~`。路径优先级为 `--download-dir` 参数、配置文件、系统默认目录。
+`download_dir` 省略时，使用系统下载目录下的 `tg-comment-uploader/reupload/`。Linux 读取 XDG 的 `user-dirs.dirs` 中的 `XDG_DOWNLOAD_DIR`，支持本地化目录和 `XDG_CONFIG_HOME`；未配置时使用 `~/Downloads`。也可填入自定义路径。相对路径相对项目根目录，支持 `~`。路径优先级为 `--download-dir` 参数、配置文件、系统默认目录。
 
-默认在确认发送成功并保存返回消息 ID 后，自动删除该任务的本地下载文件。使用 `--keep-downloads` 可保留本次上传完成的文件；配置中的 `keep_downloads: true` 也可长期启用保留。未完成任务的文件用于恢复，上传过程中不删除。自动清理意图随确认记录一起保存，若中断在确认与删除之间，下次启动会重试清理；此前明确保留的文件不会因下一次普通启动而被删除。
+默认在确认发送成功并保存返回消息 ID 后，自动删除该任务的本地下载文件。使用 `--keep-downloads` 可保留本次上传完成的文件；配置中的 `keep_downloads = true` 也可长期启用保留。未完成任务的文件用于恢复，上传过程中不删除。自动清理意图随确认记录一起保存，若中断在确认与删除之间，下次启动会重试清理；此前明确保留的文件不会因下一次普通启动而被删除。
 
-旧配置仍可执行 `upload`。`reupload` 不依赖上传 profile，不从 profile 自动猜测备份目标。真实配置通过脚本添加缺失字段，不输出凭据或整个配置。
+省略 `reupload` 表仍可执行 `upload`。`reupload` 不依赖上传 profile，不从 profile 自动猜测备份目标。默认配置从旧 JSON 转成根目录的 TOML 后，仍复用原会话和队列，保留任务顺序及随机 ID。
 
 ## 使用
 
 1. 新建私有备份频道 B，把现有 Bot 加为管理员并允许发布消息；也可以使用已经向 Bot 发过消息的私聊。
-2. 在 `config/config.json` 的 `reupload.chat_id` 填入 B 的数字 ID。不要填写源频道 A，也不要填写 Bot 的 ID。
+2. 在 `config.toml` 的 `reupload.chat_id` 填入 B 的数字 ID。不要填写源频道 A，也不要填写 Bot 的 ID。
 3. 启动监听后，再把 A 中的消息批量转发到 B：
 
 ```bash
@@ -116,7 +113,7 @@ local snapshot ready for inputs 5,6,7,8: all content saved and verified; these i
 
 ```bash
 just reupload --status
-just --set config config/other.json reupload
+just --set config /private/other.toml reupload
 ```
 
 下载保存在 `download_dir/<会话标识>/<任务>/<输入消息ID>/`，包含 `message.json`、媒体文件及适用时的 `thumbnail.jpg`。JSON 保存可读文字及文字实体；媒体按图片或文件类型下载，原文件名另存于元数据并在上传时恢复。队列位于 `.local/tg-comment-uploader/mtproto/reupload/<会话标识>/queue-v1.json`，保存完整的 Telegram 消息快照和校验值。不要删除队列来“重试”，否则已确认记录及随机 ID 会丢失。
