@@ -67,6 +67,10 @@ class Job(Record):
         return self.status in {"confirmed", "duplicate", "abandoned"}
 
     @property
+    def needs_download(self) -> bool:
+        return self.status in {"queued", "downloading"}
+
+    @property
     def first_id(self) -> int:
         return self.messages[0].message_id
 

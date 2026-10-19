@@ -7,6 +7,7 @@ api_hash = "REPLACE_WITH_API_HASH"
 # Set chat_id before running reupload. Omit download_dir to use system Downloads.
 # chat_id = "-1001234567890"
 # download_dir = "~/Downloads/tg-comment-uploader/reupload"
+# Default for the Python CLI; just reupload / reupload-keep / download select their own policy.
 keep_downloads = false
 retries = 5
 

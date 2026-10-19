@@ -1,8 +1,16 @@
-# 转发消息下载后重新上传
+# 转发消息下载与重新上传
 
 ## 范围与命令
 
-保留 `just upload` 的本地文件上传功能，新增 `just reupload`。两个命令共用项目进程锁、Bot 凭据和 Telethon 会话，不能同时运行。无需用户账号登录、Bot API 本地服务器或新增第三方库。
+转发消息提供三个入口，按是否上传、是否保留本地文件选择：
+
+| 命令 | 流程 |
+| --- | --- |
+| `just reupload` | 下载 → 上传到同一会话 → 清理本地文件 |
+| `just reupload-keep` | 下载 → 上传到同一会话 → 保留本地文件 |
+| `just download` | 下载 → 保留本地文件，不上传 |
+
+三个命令复用同一套配置、监听、队列、下载和断点续传逻辑。它们与本地文件上传命令 `just upload` 共用项目进程锁、Bot 凭据和 Telethon 会话，不能同时运行。无需用户账号登录、Bot API 本地服务器或新增第三方库。
 
 `reupload` 监听配置指定的一个频道或与 Bot 的私聊：接收人工转发的消息，先完整下载到硬盘，再使用本地文件重新上传到同一个会话。频道中 Bot 必须有接收频道更新和发布消息所需的权限。推荐使用单独的私有备份频道。不读取原频道历史、链接或评论区；收到什么，就备份什么。禁止转发的内容无法通过这个入口导入。
 
@@ -28,7 +36,9 @@ retries = 5
 
 `download_dir` 省略时，使用系统下载目录下的 `tg-comment-uploader/reupload/`。Linux 读取 XDG 的 `user-dirs.dirs` 中的 `XDG_DOWNLOAD_DIR`，支持本地化目录和 `XDG_CONFIG_HOME`；未配置时使用 `~/Downloads`。也可填入自定义路径。相对路径相对项目根目录，支持 `~`。路径优先级为 `--download-dir` 参数、配置文件、系统默认目录。
 
-默认在确认发送成功并保存返回消息 ID 后，自动删除该任务的本地下载文件。使用 `--keep-downloads` 可保留本次上传完成的文件；配置中的 `keep_downloads = true` 也可长期启用保留。未完成任务的文件用于恢复，上传过程中不删除。自动清理意图随确认记录一起保存，若中断在确认与删除之间，下次启动会重试清理；此前明确保留的文件不会因下一次普通启动而被删除。
+`just reupload` 在确认发送成功并保存返回消息 ID 后，自动删除该任务的本地下载文件；`just reupload-keep` 和 `just download` 保留本地文件。三个入口明确选择处理策略，不受配置 `keep_downloads` 的值影响。旧用法 `just reupload --keep-downloads` 仍可使用。直接运行 Python CLI 的 `reupload` 时，未指定 `--keep-downloads` 或 `--no-keep-downloads` 才使用配置值。
+
+未完成任务的文件用于恢复，上传过程中不删除。自动清理意图随确认记录一起保存，若中断在确认与删除之间，下次 `just reupload` 会重试清理；两个保留文件的入口会暂停这类清理。此前已确认上传且明确保留的文件不会因下一次普通启动而被删除。
 
 省略 `reupload` 表仍可执行 `upload`。`reupload` 不依赖上传 profile，不从 profile 自动猜测备份目标。默认配置从旧 JSON 转成根目录的 TOML 后，仍复用原会话和队列，保留任务顺序及随机 ID。
 
@@ -40,15 +50,25 @@ retries = 5
 
 ```bash
 just reupload
+# 上传后也保留本地副本：
+just reupload-keep
+# 仅保存到本地：
+just download
 ```
 
 临时指定下载目录（本次命令生效，直接使用给定目录）：
 
 ```bash
 just reupload --download-dir ~/Downloads/my-backups
+just reupload-keep --download-dir ~/Downloads/my-backups
+just download --download-dir ~/Downloads/my-backups
 ```
 
 普通消息逐条下载、上传，相册先下载整组后一起发送。运行中用 Ctrl+C 或 SIGTERM 停止；再次运行同一命令恢复队列。不需要 `serve` 命令。
+
+`just download` 同样持续监听 `reupload.chat_id` 指定会话中的转发消息；它不会扫描历史或自动下载原频道内容。文字、媒体、缩略图保存并校验后，任务保留为待上传状态，继续处理下一项。重启下载命令会跳过已下载的任务，未完成下载继续从有效断点恢复；支持的消息类型、缩略图处理及文件大小限制与 `reupload` 相同。
+
+三个入口共用队列：之后执行 `just reupload` 或 `just reupload-keep`，会按原顺序上传这些本地副本，分别在成功后清理或保留文件。若只想处理新转发而暂缓上传之前下载的内容，可加 `--no-resume`。已有发送结果不确定的任务不会被下载命令重新发送或标记为成功，其原状态和发送随机 ID 保留，等待以后恢复上传。
 
 监听就绪后，连接持续至少 60 秒即视为稳定恢复。之后再断线，重连失败计数会清零，退避重新从 1 秒开始；短暂连接后立即断开仍累计失败。`reupload.retries` 限制连续失败的额外重试次数，默认 5，即首次尝试加 5 次重试；持续无法连接时仍会退出并保留队列。登录失败或清理退出时的等待不计入稳定时长。
 
@@ -62,7 +82,7 @@ just reupload --no-resume
 
 下次执行 `just reupload` 或 `just reupload --resume`，会继续已有队列中的未完成任务。恢复的旧任务会追加在本次新备份之后，无法插回已经发送的消息之前。`--status` 始终统计全部已保存任务，包括本次跳过的旧任务。
 
-所有操作都使用 `just reupload` 的参数。先停止旧监听，再按需启动：
+先停止旧监听，再按需启动。`reupload` 和 `reupload-keep` 支持以下维护参数：
 
 ```bash
 # 放弃旧的未完成任务，再监听新的转发：
@@ -72,10 +92,12 @@ just reupload --delete-downloads
 # 放弃未完成任务并清理所有已记录任务的本地文件，再监听：
 just reupload --discard-pending --delete-downloads
 # 上传完成后保留本地文件：
-just reupload --keep-downloads
+just reupload-keep
 ```
 
 `--discard-pending` 和 `--delete-downloads` 在登录前执行，然后继续监听，共用 `upload`、`reupload` 的进程锁。这两个参数不能与只读的 `--status` 同用。`--discard-pending` 将未完成任务标记为已放弃，保留输入 ID、快照、发送随机 ID 和已完成记录，后续默认启动也不会恢复这些任务。还会保存截止时间，忽略本次操作执行时及之前的离线转发更新（按 B 中转发时间判断，精度为秒，包含当前秒），避免旧消息补收后重新入队。之后想重新备份已放弃的内容，需要重新转发。
+
+`just download` 支持 `--status`、`--no-resume`、`--discard-pending` 和 `--download-dir`，不提供删除本地文件的参数。`--discard-pending` 也会放弃已下载但尚未上传的任务，本地文件仍保留。
 
 单独放弃任务保留本地文件；`--delete-downloads` 清理当前会话中已完成及已放弃任务的下载文件，包含此前使用 `--keep-downloads` 保留的文件。未完成任务的文件继续保留用于恢复；需要一并删除时组合使用 `--discard-pending --delete-downloads`。清理不删除配置、Bot 会话或队列，已完成的任务记录仍然有效。清理失败时停止启动监听，放弃状态仍保留，重试 `--delete-downloads` 即可清理残余文件。放弃任务不会删除 Telegram 中的消息；若任务中断在最终发送阶段，频道里可能已经有备份，命令会提示发送结果不确定的任务数，再次转发前应先核对。
 
@@ -90,6 +112,8 @@ just reupload --keep-downloads
 ```text
 batch complete: 5 task(s), 5 message(s) confirmed; 0 active pending; waiting for new forwards (Ctrl+C to stop)
 ```
+
+下载命令的完成提示使用 `downloaded; local files retained`，表示本地下载已完成，不表示已经上传。
 
 计数范围是本轮监听中自上次空闲以来确认的任务；相册算一个任务，消息数按成员数统计。提示只覆盖程序当前已收到的任务，不代表未来不会收到新转发。持续空闲不会反复刷屏，下一批处理完会再提示一次。等待相册成员、下载中、等待 Telegram 确认或任务失败时，都不会提前报告完成。`--no-resume` 暂缓的旧任务会另外显示 `deferred task(s) retained`，确认上传后仍未清理成功的本地文件会显示 `task(s) awaiting local cleanup`，不会混同为已处理完。
 
@@ -113,18 +137,21 @@ local snapshot ready for inputs 5,6,7,8: all content saved and verified; these i
 
 ```bash
 just reupload --status
+just download --status
 just --set config /private/other.toml reupload
 ```
 
 下载保存在 `download_dir/<会话标识>/<任务>/<输入消息ID>/`，包含 `message.json`、媒体文件及适用时的 `thumbnail.jpg`。JSON 保存可读文字及文字实体；媒体按图片或文件类型下载，原文件名另存于元数据并在上传时恢复。队列位于 `.local/tg-comment-uploader/mtproto/reupload/<会话标识>/queue-v1.json`，保存完整的 Telegram 消息快照和校验值。不要删除队列来“重试”，否则已确认记录及随机 ID 会丢失。
 
+`just download --status` 单独统计已下载、待下载和等待上传确认的任务；`just reupload --status` 则将已下载但未上传的任务计入待上传数量。两种状态查询均不登录或修改队列。
+
 修改下载目录后，下次启动会先迁移当前会话的本地文件，再开始监听；已完成记录、待处理任务、顺序及随机 ID 保留。相同文件系统直接移动，跨文件系统先完整复制并落盘，再更新队列路径、清理旧副本。迁移中断后用相同目录重试即可继续。若目标会话目录已有不属于本次迁移的文件，会停止并报告冲突，不覆盖它们。其他会话的文件不移动。`--status` 只显示目录和待迁移提示，不执行迁移。`--download-dir` 不修改配置，后续省略参数会按配置或系统默认目录再次迁移；长期使用自定义目录请写入配置。
 
 ## 模块与复用
 
-- 配置定义和加载独立成模块，两个命令使用同一套校验。
+- 配置定义和加载独立成模块，各命令使用同一套校验。
 - 现有 MTProto 上传拆分为会话管理、文件分片上传、消息发送及响应校验；同步 `upload` 和异步监听流程共用这些能力，包括文件完整性校验、最终请求超时和随机 ID。
-- `reupload` 单独负责消息采集、相册归并、下载、持久队列和串行调度，不复刻底层上传实现。
+- `reupload` 和 `download` 共用消息采集、相册归并、下载、持久队列和串行调度；下载模式在本地快照就绪后结束当前任务，不进入上传及清理阶段。
 - 新增或拆分的 Python 模块不超过 400 行；现有上传 pending 文件格式保持兼容。
 
 ## 持久化、顺序和恢复

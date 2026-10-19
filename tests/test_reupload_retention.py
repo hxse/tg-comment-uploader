@@ -11,8 +11,10 @@ from tg_comment_uploader.reupload_download import cleanup_job, job_directory
 from tg_comment_uploader.reupload_service import ReuploadService
 
 
-def startup_only(tmp_path, queue, monkeypatch, *, keep=False):
-    service = ReuploadService(queue, bot_id=BOT, retries=0, keep_downloads=keep)
+def startup_only(tmp_path, queue, monkeypatch, *, keep=False, download_only=False):
+    service = ReuploadService(
+        queue, bot_id=BOT, retries=0, keep_downloads=keep, download_only=download_only
+    )
 
     async def no_work(*args):
         return
@@ -66,8 +68,14 @@ def test_cleanup_failure_is_retried_after_restart_without_uploading_again(
     restored = queue_at(tmp_path)
     assert restored.get(job.key).cleanup_pending
     assert job_directory(restored, job).exists()
-    # This was already scheduled for cleanup by the previous run's policy.
+    # Retaining modes postpone even cleanup scheduled by an earlier run.
     startup_only(tmp_path, restored, monkeypatch, keep=True)
+    assert job_directory(restored, job).exists()
+    assert queue_at(tmp_path).get(job.key).cleanup_pending
+    startup_only(tmp_path, restored, monkeypatch, download_only=True)
+    assert job_directory(restored, job).exists()
+    assert queue_at(tmp_path).get(job.key).cleanup_pending
+    startup_only(tmp_path, restored, monkeypatch)
     assert not job_directory(restored, job).exists()
     assert not queue_at(tmp_path).get(job.key).cleanup_pending
 

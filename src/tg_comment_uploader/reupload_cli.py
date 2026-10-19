@@ -1,4 +1,4 @@
-"""Command wiring, shared lock and reconnect policy for reupload."""
+"""Shared command wiring, lock and reconnect policy for download and reupload."""
 
 from __future__ import annotations
 
@@ -22,9 +22,19 @@ from .upload_state import get_mtproto_paths
 
 
 def add_reupload_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser(
-        "reupload", help="download forwards and upload back to the same chat"
+    _add_listener_parser(subparsers, "reupload", download_only=False)
+    _add_listener_parser(subparsers, "download", download_only=True)
+
+
+def _add_listener_parser(
+    subparsers: argparse._SubParsersAction, name: str, *, download_only: bool
+) -> None:
+    help_text = (
+        "download forwards and keep local files for optional later reupload"
+        if download_only
+        else "download forwards and upload back to the same chat"
     )
+    parser = subparsers.add_parser(name, help=help_text, description=help_text)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument(
         "--download-dir",
@@ -40,23 +50,27 @@ def add_reupload_parser(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="abandon unfinished tasks and old offline forwards before listening",
     )
-    parser.add_argument(
-        "--delete-downloads",
-        action="store_true",
-        help="clean finished task downloads before listening; unfinished task files are retained",
-    )
-    parser.add_argument(
-        "--keep-downloads",
-        action="store_true",
-        help="keep downloaded files after confirmed upload (default: delete after success)",
-    )
+    if not download_only:
+        parser.add_argument(
+            "--delete-downloads",
+            action="store_true",
+            help="clean finished task downloads before listening; unfinished task files are retained",
+        )
+        parser.add_argument(
+            "--keep-downloads",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="keep files after upload; --no-keep-downloads removes them (default: config)",
+        )
+    else:
+        parser.set_defaults(keep_downloads=True, delete_downloads=False)
     parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="resume unfinished jobs (default); --no-resume handles only new forwards this run",
     )
-    parser.set_defaults(func=run_reupload)
+    parser.set_defaults(func=run_reupload, download_only=download_only)
 
 
 def run_reupload(args: argparse.Namespace) -> int:
@@ -99,10 +113,20 @@ def run_reupload_locked(args: argparse.Namespace) -> int:
     pending = sum(not j.terminal for j in queue.state.jobs)
     legacy_skipped = sum(j.status == "duplicate" for j in queue.state.jobs)
     abandoned = sum(j.status == "abandoned" for j in queue.state.jobs)
-    print(
-        f"reupload queue: {confirmed} confirmed, {pending} pending, "
-        f"{legacy_skipped} legacy skipped, {abandoned} abandoned"
-    )
+    if args.download_only:
+        downloaded = sum(j.status == "ready" for j in queue.state.jobs)
+        awaiting_confirmation = sum(j.status == "sending" for j in queue.state.jobs)
+        pending_downloads = sum(j.needs_download for j in queue.state.jobs)
+        print(
+            f"download queue: {downloaded} downloaded, {pending_downloads} pending download, "
+            f"{awaiting_confirmation} awaiting upload confirmation; "
+            f"{confirmed} uploaded, {legacy_skipped} legacy skipped, {abandoned} abandoned"
+        )
+    else:
+        print(
+            f"reupload queue: {confirmed} confirmed, {pending} pending, "
+            f"{legacy_skipped} legacy skipped, {abandoned} abandoned"
+        )
     print(f"downloads: {download_root}")
     print(f"state: {queue.path}")
     if args.status:
@@ -137,7 +161,10 @@ def run_reupload_locked(args: argparse.Namespace) -> int:
             queue,
             bot_id=paths.owner.bot_id,
             retries=options.retries,
-            keep_downloads=args.keep_downloads or options.keep_downloads,
+            keep_downloads=(
+                options.keep_downloads if args.keep_downloads is None else args.keep_downloads
+            ),
+            download_only=args.download_only,
             new_messages_since=new_messages_since,
         )
         try:
@@ -163,7 +190,7 @@ def run_reupload_locked(args: argparse.Namespace) -> int:
             if failures > options.retries:
                 raise AppError(
                     f"listener failed after {failures} consecutive attempts; "
-                    f"rerun just reupload to resume: {exc}"
+                    f"rerun just {service.command} to resume: {exc}"
                 ) from exc
             delay = retry_delay_seconds(exc, failed_attempt=failures)
             print(f"reconnecting in {delay}s; queue and random IDs retained: {exc}", flush=True)

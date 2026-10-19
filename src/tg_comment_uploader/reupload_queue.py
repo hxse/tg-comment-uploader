@@ -186,16 +186,22 @@ class ReuploadQueue:
         if self.state.problem:
             raise AppError(self.state.problem)
 
-    def next_job(self) -> Job | None:
+    def next_job(self, *, download_only: bool = False) -> Job | None:
         self.check_problem()
         return next(
-            (j for j in self.state.jobs if not j.terminal and j.key not in self._deferred_keys),
+            (
+                j
+                for j in self.state.jobs
+                if not j.terminal
+                and j.key not in self._deferred_keys
+                and (not download_only or j.needs_download)
+            ),
             None,
         )
 
-    def begin(self, job: Job) -> Job:
+    def begin(self, job: Job, *, download_only: bool = False) -> Job:
         self.check_problem()
-        if self.next_job() != job:
+        if self.next_job(download_only=download_only) != job:
             raise AppError("cannot start a later job before an earlier input")
         if any(
             job.first_id < other.first_id < job.messages[-1].message_id

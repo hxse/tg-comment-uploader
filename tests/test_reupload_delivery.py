@@ -14,14 +14,23 @@ from tg_comment_uploader.reupload_queue import ReuploadQueue
 from tg_comment_uploader.reupload_service import ReuploadService
 
 
-def process_all(tmp_path: Path, bot: FakeBot, queue: ReuploadQueue, *, keep: bool = True) -> None:
-    service = ReuploadService(queue, bot_id=BOT, retries=0, keep_downloads=keep)
+def process_all(
+    tmp_path: Path,
+    bot: FakeBot,
+    queue: ReuploadQueue,
+    *,
+    keep: bool = True,
+    download_only: bool = False,
+) -> None:
+    service = ReuploadService(
+        queue, bot_id=BOT, retries=0, keep_downloads=keep, download_only=download_only
+    )
     bot.handler = service.on_message
     with sender_at(tmp_path, bot) as sender:
 
         async def work() -> None:
             client, peer = await sender.connect()
-            while (job := queue.next_job()) is not None:
+            while (job := queue.next_job(download_only=download_only)) is not None:
                 await service.process_job(sender, client, peer, job)
 
         sender.run_service(work())

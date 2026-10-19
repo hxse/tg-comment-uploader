@@ -155,11 +155,16 @@ just upload-config <config> <absolute-path>...
 just upload-config-profile <config> <profile> <absolute-path>...
 just upload-config-retry <config> <retries> <absolute-path>...
 just upload-config-profile-retry <config> <profile> <retries> <absolute-path>...
+just reupload                         # 下载、上传、清理本地
+just reupload-keep                    # 下载、上传、保留本地
+just download                        # 只下载、保留本地
 just check
 just test
 ```
 
 默认 config、profile 和 retries 分别是 `config.toml`、`default`、`5`。现有参数顺序和含空格路径转发保持不变。
+
+转发消息的三个入口复用 `[reupload]` 配置及同一个持久队列；入口明确选择保留策略，覆盖配置中的 `keep_downloads`。`download` 完成的本地副本可由后续 `reupload` 或 `reupload-keep` 继续上传，详见 [下载与重新上传](reupload-design.md)。
 
 静态检查：
 

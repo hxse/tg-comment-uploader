@@ -29,6 +29,7 @@ class ReuploadService:
         bot_id: int,
         retries: int,
         keep_downloads: bool = False,
+        download_only: bool = False,
         settle_seconds: float = SETTLE_SECONDS,
         progress: ReuploadProgress | None = None,
         new_messages_since: int | None = None,
@@ -36,7 +37,11 @@ class ReuploadService:
         self.queue = queue
         self.bot_id = bot_id
         self.retries = retries
-        self.keep_downloads = keep_downloads
+        self.download_only = download_only
+        self.keep_downloads = keep_downloads or download_only
+        self.command = (
+            "download" if download_only else "reupload-keep" if keep_downloads else "reupload"
+        )
         self.settle_seconds = settle_seconds
         self.intake_error: AppError | None = None
         self.started_at = time.time()
@@ -83,19 +88,20 @@ class ReuploadService:
         if utils.get_peer_id(peer) != self.queue.state.chat_id:
             raise AppError("resolved Telegram peer does not match reupload.chat_id")
         if not isinstance(peer, (types.InputPeerChannel, types.InputPeerUser)):
-            raise AppError("reupload supports a channel or a private chat with the bot")
+            raise AppError(f"{self.command} supports a channel or a private chat with the bot")
         self.started_at = time.time()
         # Fetch differences using the progress restored by catch_up=True.
         # This is not a history scan and cannot recover an arbitrarily long offline gap.
         await client.catch_up()
         self.progress.log(
-            "reupload listening; forward messages to the configured chat (Ctrl+C to stop)",
+            f"{self.command} listening; forward messages to the configured chat (Ctrl+C to stop)",
         )
-        # Retry only cleanup requested by the run that confirmed this job. A later
-        # default run must not erase files explicitly retained by --keep-downloads.
-        for job in self.queue.state.jobs:
-            if job.cleanup_pending:
-                self._cleanup(job)
+        # Retaining modes also postpone cleanup requested by an earlier run.
+        # A later cleanup-enabled run resumes those durable cleanup intents.
+        if not self.keep_downloads:
+            for job in self.queue.state.jobs:
+                if job.cleanup_pending:
+                    self._cleanup(job)
         connected_at = time.monotonic()
         worker = asyncio.create_task(self.work(sender, client, peer))
         disconnected = asyncio.ensure_future(client.disconnected)
@@ -128,7 +134,7 @@ class ReuploadService:
         completed_tasks = completed_messages = 0
         while True:
             self.check_intake()
-            job = self.queue.next_job()
+            job = self.queue.next_job(download_only=self.download_only)
             if job is None:
                 if completed_tasks:
                     self._log_batch_complete(completed_tasks, completed_messages)
@@ -148,8 +154,12 @@ class ReuploadService:
             completed_messages += len(job.messages)
 
     def _log_batch_complete(self, tasks: int, messages: int) -> None:
-        details = [f"{tasks} task(s), {messages} message(s) confirmed", "0 active pending"]
-        deferred = sum(not job.terminal for job in self.queue.state.jobs)
+        outcome = "downloaded; local files retained" if self.download_only else "confirmed"
+        details = [f"{tasks} task(s), {messages} message(s) {outcome}", "0 active pending"]
+        deferred = sum(
+            job.needs_download if self.download_only else not job.terminal
+            for job in self.queue.state.jobs
+        )
         cleanup = sum(job.cleanup_pending for job in self.queue.state.jobs)
         if deferred:
             details.append(f"{deferred} deferred task(s) retained")
@@ -165,7 +175,7 @@ class ReuploadService:
             await self._process_job(sender, client, peer, job)
 
     async def _process_job(self, sender: MtprotoSender, client: Any, peer: Any, job: Job) -> None:
-        job = self.queue.begin(job)
+        job = self.queue.begin(job, download_only=self.download_only)
         for attempt in range(1, self.retries + 2):
             self.check_intake()
             try:
@@ -183,6 +193,9 @@ class ReuploadService:
                     f"local snapshot ready for inputs {inputs}: all content saved and verified; "
                     "these input messages are no longer needed for this task"
                 )
+                if self.download_only:
+                    self.progress.log(f"downloaded {job.key}: local files retained")
+                    return
 
                 def before_send() -> None:
                     self.check_intake()
@@ -230,7 +243,7 @@ class ReuploadService:
                 raise error
             if attempt > self.retries:
                 raise AppError(
-                    f"{job.key} failed after {attempt} attempts; rerun just reupload to resume "
+                    f"{job.key} failed after {attempt} attempts; rerun just {self.command} to resume "
                     f"the saved queue: {error}"
                 ) from error
             delay = retry_delay_seconds(error, failed_attempt=attempt)
