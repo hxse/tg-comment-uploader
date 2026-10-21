@@ -112,12 +112,10 @@ def test_incomplete_album_prevents_premature_batch_completion(tmp_path: Path) ->
         sender.run_service(scenario())
 
 
-def test_batch_summary_distinguishes_deferred_work_and_failed_local_cleanup(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_batch_summary_reports_failed_local_cleanup(tmp_path: Path, monkeypatch) -> None:
     queue = queue_at(tmp_path)
     queue.enqueue(forwarded(1, kind="document"))
-    queue.defer_pending()
+    queue.confirm("message-1", (100,))
     queue.enqueue(forwarded(2, kind="document"))
     progress = CompletionProgress()
     service = ReuploadService(queue, bot_id=BOT, retries=0, settle_seconds=0, progress=progress)
@@ -135,9 +133,8 @@ def test_batch_summary_distinguishes_deferred_work_and_failed_local_cleanup(
                 await asyncio.wait_for(progress.completed.wait(), 3)
                 summary = progress.summaries[0]
                 assert "1 task(s), 1 message(s) confirmed; 0 active pending" in summary
-                assert "1 deferred task(s) retained" in summary
                 assert "1 task(s) awaiting local cleanup" in summary
-                assert queue.get("message-1").status == "queued"
+                assert queue.get("message-1").status == "confirmed"
             finally:
                 listener.cancel()
                 await asyncio.gather(listener, return_exceptions=True)

@@ -32,7 +32,6 @@ class ReuploadService:
         download_only: bool = False,
         settle_seconds: float = SETTLE_SECONDS,
         progress: ReuploadProgress | None = None,
-        new_messages_since: int | None = None,
     ) -> None:
         self.queue = queue
         self.bot_id = bot_id
@@ -46,7 +45,6 @@ class ReuploadService:
         self.intake_error: AppError | None = None
         self.started_at = time.time()
         self.connected_seconds = 0.0
-        self.new_messages_since = new_messages_since
         self.progress = progress if progress is not None else ReuploadProgress()
 
     def client_factory(self, *args: Any, **kwargs: Any) -> TelegramClient:
@@ -62,12 +60,6 @@ class ReuploadService:
         try:
             message = event.message
             if accepts_forward(message, self.queue.state.chat_id, self.bot_id):
-                # Use the forwarding time in B, not the original post's date.
-                # Keep catch-up enabled for reconnects within this command.
-                if self.new_messages_since is not None and (
-                    message.date is None or message.date.timestamp() < self.new_messages_since
-                ):
-                    return
                 if self.queue.enqueue(message):
                     self.progress.log(f"queued input {message.id}")
         except Exception as exc:
@@ -156,13 +148,7 @@ class ReuploadService:
     def _log_batch_complete(self, tasks: int, messages: int) -> None:
         outcome = "downloaded; local files retained" if self.download_only else "confirmed"
         details = [f"{tasks} task(s), {messages} message(s) {outcome}", "0 active pending"]
-        deferred = sum(
-            job.needs_download if self.download_only else not job.terminal
-            for job in self.queue.state.jobs
-        )
         cleanup = sum(job.cleanup_pending for job in self.queue.state.jobs)
-        if deferred:
-            details.append(f"{deferred} deferred task(s) retained")
         if cleanup:
             details.append(f"{cleanup} task(s) awaiting local cleanup")
         self.progress.log(

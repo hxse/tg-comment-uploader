@@ -47,5 +47,5 @@ def delete_downloads(queue: ReuploadQueue) -> None:
     if pending:
         print(
             f"downloads for {pending} unfinished task(s) retained for resume; "
-            "combine --discard-pending --delete-downloads to abandon and remove them"
+            "combine --fresh --delete-downloads to abandon and remove them"
         )

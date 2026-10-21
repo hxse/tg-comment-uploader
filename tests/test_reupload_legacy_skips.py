@@ -88,17 +88,17 @@ def test_status_only_describes_legacy_skips_without_mutating_them(
     assert not listeners
 
 
-@pytest.mark.parametrize("no_resume", [False, True])
-def test_cli_restores_skips_before_applying_resume_selection(
-    tmp_path: Path, monkeypatch, no_resume: bool
+@pytest.mark.parametrize("fresh", [False, True])
+def test_cli_restores_skips_before_applying_fresh_selection(
+    tmp_path: Path, monkeypatch, fresh: bool
 ) -> None:
     queue = legacy_queue(tmp_path)
     listeners = configure_cli(tmp_path, monkeypatch, queue)
-    assert main(["reupload", *(["--no-resume"] if no_resume else [])]) == 0
+    assert main(["reupload", *(["--fresh"] if fresh else [])]) == 0
     assert len(listeners) == 1
-    assert queue.state.jobs[1].status == "queued"
-    assert (queue.next_job() is None) is no_resume
-    assert queue_at(tmp_path).next_job() is not None
+    assert queue.state.jobs[1].status == ("abandoned" if fresh else "queued")
+    assert (queue.next_job() is None) is fresh
+    assert (queue_at(tmp_path).next_job() is None) is fresh
 
 
 def test_delete_downloads_preserves_files_of_restored_tasks(tmp_path: Path, monkeypatch) -> None:

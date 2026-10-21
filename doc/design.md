@@ -166,6 +166,8 @@ just test
 
 转发消息的三个入口复用 `[reupload]` 配置及同一个持久队列；入口明确选择保留策略，覆盖配置中的 `keep_downloads`。`download` 完成的本地副本可由后续 `reupload` 或 `reupload-keep` 继续上传，详见 [下载与重新上传](reupload-design.md)。
 
+三个入口默认继续未完成任务，无需额外参数。使用 `--fresh` 永久放弃旧的未完成任务并接收新转发，本地文件保留；例如 `just reupload --fresh` 或 `just download --fresh`。
+
 静态检查：
 
 ```sh

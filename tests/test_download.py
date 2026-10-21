@@ -120,7 +120,7 @@ def test_download_listener_reports_completion_once_and_accepts_the_next_batch(
 ) -> None:
     queue = queue_at(tmp_path)
     queue.enqueue(forwarded(1))
-    queue.defer_pending()
+    queue.confirm("message-1", (100,))
     queue.enqueue(forwarded(2, kind="photo", group=7))
     queue.enqueue(forwarded(3, kind="document", group=7))
     progress = CompletionProgress()
@@ -135,7 +135,6 @@ def test_download_listener_reports_completion_once_and_accepts_the_next_batch(
             try:
                 await asyncio.wait_for(progress.completed.wait(), 3)
                 assert "1 task(s), 2 message(s) downloaded" in progress.summaries[0]
-                assert "1 deferred task(s) retained" in progress.summaries[0]
                 await asyncio.sleep(0.3)
                 assert len(progress.summaries) == 1
                 progress.completed.clear()
@@ -148,7 +147,7 @@ def test_download_listener_reports_completion_once_and_accepts_the_next_batch(
                 await asyncio.gather(listener, return_exceptions=True)
 
         sender.run_service(scenario())
-    assert queue.get("message-1").status == "queued"
+    assert queue.get("message-1").status == "confirmed"
     assert queue.get("album-7").status == queue.get("message-4").status == "ready"
     assert not bot.requests and not bot.delivered
 

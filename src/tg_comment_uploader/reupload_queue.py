@@ -53,7 +53,6 @@ class ReuploadQueue:
                 )
         else:
             self.state = QueueState(owner=owner, chat_id=chat_id, download_root=str(download_root))
-        self._deferred_keys: set[str] = set()
         self._inputs = {m.message_id for j in self.state.jobs for m in j.messages}
         self._random_ids = {m.random_id for j in self.state.jobs for m in j.messages}
 
@@ -72,11 +71,6 @@ class ReuploadQueue:
                 }
             )
         )
-
-    def defer_pending(self) -> int:
-        """Exclude existing pending jobs for this command without modifying their state."""
-        self._deferred_keys = {j.key for j in self.state.jobs if not j.terminal}
-        return len(self._deferred_keys)
 
     def _commit(self, state: QueueState) -> None:
         write_private_json(self.path, state.model_dump(mode="json"), label="reupload queue")
@@ -141,8 +135,6 @@ class ReuploadQueue:
         ):
             return False
         key = job_key(message.id, message.grouped_id)
-        if key in self._deferred_keys:
-            return False
         old = next((j for j in self.state.jobs if j.key == key), None)
         if old is not None and old.status == "abandoned":
             return False
@@ -192,9 +184,7 @@ class ReuploadQueue:
             (
                 j
                 for j in self.state.jobs
-                if not j.terminal
-                and j.key not in self._deferred_keys
-                and (not download_only or j.needs_download)
+                if not j.terminal and (not download_only or j.needs_download)
             ),
             None,
         )

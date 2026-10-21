@@ -49,7 +49,6 @@ def test_discard_is_permanent_and_keeps_confirmed_records_and_random_ids(
     assert abandoned.status == "abandoned" and abandoned.abandoned_from == status
     assert abandoned.messages == before[1].messages
     assert restored.next_job() is None
-    assert restored.defer_pending() == 0
     assert not restored.enqueue(pending)
     assert (files / "media.bin").read_bytes() == b"completed bytes"
     # Future forwards are new requests, whether the old input was confirmed or abandoned.
@@ -245,11 +244,11 @@ def test_discard_runs_before_listening_is_locked_and_status_reports_terminal_cou
     listeners = configure_cli(tmp_path, monkeypatch, queue)
     before = queue.path.read_bytes()
     with upload_instance_lock(tmp_path):
-        assert main(["reupload", "--discard-pending"]) == 1
+        assert main(["reupload", "--fresh"]) == 1
     assert "already running" in capsys.readouterr().err
     assert queue.path.read_bytes() == before
     assert not listeners
-    assert main(["reupload", "--discard-pending"]) == 0
+    assert main(["reupload", "--fresh"]) == 0
     assert len(listeners) == 1 and listeners[0].queue.next_job() is None
     assert main(["reupload", "--status"]) == 0
     output = capsys.readouterr().out
@@ -276,12 +275,21 @@ def test_delete_flag_cleans_finished_files_and_preserves_pending_downloads(
     assert len(listeners) == 1
 
 
-@pytest.mark.parametrize("flag", ["--discard-pending", "--delete-downloads"])
-def test_status_refuses_mutating_flags(tmp_path: Path, monkeypatch, capsys, flag: str) -> None:
-    listeners = configure_cli(tmp_path, monkeypatch, queue_at(tmp_path))
-    assert main(["reupload", "--status", flag]) == 1
+@pytest.mark.parametrize(
+    ("command", "flag"),
+    [("reupload", "--fresh"), ("reupload", "--delete-downloads"), ("download", "--fresh")],
+)
+def test_status_refuses_mutating_flags(
+    tmp_path: Path, monkeypatch, capsys, command: str, flag: str
+) -> None:
+    queue = queue_at(tmp_path)
+    queue.enqueue(forwarded(1))
+    before = queue.path.read_bytes()
+    listeners = configure_cli(tmp_path, monkeypatch, queue)
+    assert main([command, "--status", flag]) == 1
     assert "--status cannot be combined" in capsys.readouterr().err
     assert not listeners
+    assert queue.path.read_bytes() == before
 
 
 @pytest.mark.parametrize("keep", [False, True])

@@ -144,25 +144,27 @@ def test_uncertain_source_never_uses_content_only_deduplication(
     assert len(bot.delivered) == 2
 
 
-def test_new_forward_and_old_deferred_task_keep_separate_send_ids(tmp_path: Path) -> None:
+def test_new_forward_after_fresh_does_not_restore_the_old_task(tmp_path: Path) -> None:
     first = forwarded(1, kind="document", source_post=900)
     queue = queue_at(tmp_path)
     queue.enqueue(first)
     pending_ids = queue.state.jobs[0].random_ids
-    queue.defer_pending()
+    assert first.date is not None
+    queue.discard_pending(now=int(first.date.timestamp()))
     queue.enqueue(forwarded_again(first, 2))
     bot = FakeBot()
     process_all(tmp_path, bot, queue)
     assert len(bot.delivered) == 1
-    assert [j.status for j in queue.state.jobs] == ["queued", "confirmed"]
+    assert [j.status for j in queue.state.jobs] == ["abandoned", "confirmed"]
+    assert queue.state.jobs[1].random_ids != pending_ids
     restored = queue_at(tmp_path)
     resumed = FakeBot()
     resumed.delivered = dict(bot.delivered)
     process_all(tmp_path, resumed, restored)
-    assert len(resumed.delivered) == 2
-    assert [n for kind, n in resumed.timeline if kind == "download"] == [1]
+    assert len(resumed.delivered) == 1
+    assert not resumed.timeline and not resumed.requests
     assert restored.state.jobs[0].random_ids == pending_ids
-    assert restored.state.jobs[0].status == "confirmed"
+    assert restored.state.jobs[0].status == "abandoned"
     assert restored.next_job() is None
 
 

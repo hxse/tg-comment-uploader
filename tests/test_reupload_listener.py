@@ -162,11 +162,11 @@ def test_wrong_resolved_peer_stops_before_any_send(tmp_path: Path) -> None:
     assert not bot.requests
 
 
-@pytest.mark.parametrize("new_messages_since", [None, 1_700_000_000])
+@pytest.mark.parametrize("fresh", [False, True])
 def test_reconnect_catches_up_from_saved_session_progress(
     tmp_path: Path,
     monkeypatch,
-    new_messages_since: int | None,
+    fresh: bool,
 ) -> None:
     from unittest.mock import AsyncMock
 
@@ -185,13 +185,10 @@ def test_reconnect_catches_up_from_saved_session_progress(
     )
     session.save()
     session.close()
-    service = ReuploadService(
-        queue_at(tmp_path),
-        bot_id=BOT,
-        retries=0,
-        keep_downloads=True,
-        new_messages_since=new_messages_since,
-    )
+    queue = queue_at(tmp_path)
+    if fresh:
+        queue.discard_pending(now=int(NOW.timestamp()))
+    service = ReuploadService(queue, bot_id=BOT, retries=0, keep_downloads=True)
 
     async def scenario() -> None:
         # Exercise Telethon's actual session restoration and message box;

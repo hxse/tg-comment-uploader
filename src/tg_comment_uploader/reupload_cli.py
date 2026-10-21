@@ -34,7 +34,9 @@ def _add_listener_parser(
         if download_only
         else "download forwards and upload back to the same chat"
     )
-    parser = subparsers.add_parser(name, help=help_text, description=help_text)
+    parser = subparsers.add_parser(
+        name, help=help_text, description=help_text + "; resumes unfinished jobs by default"
+    )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument(
         "--download-dir",
@@ -46,9 +48,9 @@ def _add_listener_parser(
         "--status", action="store_true", help="show local queue counts without login"
     )
     parser.add_argument(
-        "--discard-pending",
+        "--fresh",
         action="store_true",
-        help="abandon unfinished tasks and old offline forwards before listening",
+        help="start fresh: permanently abandon unfinished jobs and old offline forwards; keep files",
     )
     if not download_only:
         parser.add_argument(
@@ -64,12 +66,6 @@ def _add_listener_parser(
         )
     else:
         parser.set_defaults(keep_downloads=True, delete_downloads=False)
-    parser.add_argument(
-        "--resume",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="resume unfinished jobs (default); --no-resume handles only new forwards this run",
-    )
     parser.set_defaults(func=run_reupload, download_only=download_only)
 
 
@@ -84,10 +80,8 @@ def run_reupload(args: argparse.Namespace) -> int:
 
 
 def run_reupload_locked(args: argparse.Namespace) -> int:
-    if args.status and (args.discard_pending or args.delete_downloads):
-        raise AppError("--status cannot be combined with --discard-pending or --delete-downloads")
-    # Keep the cutoff and deferred set for the whole command, including reconnects.
-    new_messages_since = None if args.resume else int(time.time())
+    if args.status and (args.fresh or args.delete_downloads):
+        raise AppError("--status cannot be combined with --fresh or --delete-downloads")
     config = load_config(args.config)
     options = config.reupload
     if options is None or options.chat_id is None:
@@ -145,15 +139,13 @@ def run_reupload_locked(args: argparse.Namespace) -> int:
     restored, discarded = queue.restore_legacy_skips()
     if restored or discarded:
         print(f"legacy skipped tasks: {restored} restored, {discarded} kept abandoned")
-    if args.discard_pending:
+    # Apply --fresh only once: reconnects must retain work received by this run.
+    if args.fresh:
         discard_pending(queue)
     if args.delete_downloads:
         print(f"cleaning stored downloads: {queue.state.download_root}")
         delete_downloads(queue)
     relocate_downloads(queue, download_root)
-    if not args.resume:
-        deferred = queue.defer_pending()
-        print(f"resume disabled: {deferred} existing pending task(s) retained; new forwards only")
     queue.check_problem()
     failures = 0
     while True:
@@ -165,7 +157,6 @@ def run_reupload_locked(args: argparse.Namespace) -> int:
                 options.keep_downloads if args.keep_downloads is None else args.keep_downloads
             ),
             download_only=args.download_only,
-            new_messages_since=new_messages_since,
         )
         try:
             with MtprotoSender(
