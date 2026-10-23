@@ -56,7 +56,12 @@ def message_kind(message: types.Message) -> Literal["text", "photo", "document"]
     if message.rich_message is not None:
         raise unsupported("rich-message content is not supported")
     media = message.media
-    if media is None or isinstance(media, types.MessageMediaEmpty):
+    # An empty link preview has no media to preserve. Keep the original text
+    # and entities, and let the existing text sender suppress preview creation.
+    empty_preview = isinstance(media, types.MessageMediaWebPage) and isinstance(
+        media.webpage, types.WebPageEmpty
+    )
+    if media is None or isinstance(media, types.MessageMediaEmpty) or empty_preview:
         if not message.message:
             raise unsupported("empty content")
         return "text"
